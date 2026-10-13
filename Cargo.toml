@@ -1,0 +1,26 @@
+[package]
+name = "s-store"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "An RDF quad store (SPARQL 1.1) with experimental property-graph support, built on s-graph, s-dict and s-parser."
+
+# Sibling working trees, like s-bench's s-dict dependency: the store is
+# developed in lockstep with the three libraries.
+[dependencies]
+s-graph = { path = "../s-graph" }
+s-dict = { path = "../s-dict" }
+s-parser = { path = "../s-parser" }
+# SPARQL REGEX/REPLACE. The only third-party dependency; compiled patterns
+# are cached per query.
+regex = "1"
+
+[features]
+# s-graph's real-file and LZ4-compressed backends; the store is generic over
+# `s_graph::BlockStorage`, these only make the aliases available.
+file = ["s-graph/file"]
+compressed = ["s-graph/compressed"]
+parallel = ["s-graph/parallel"]
+
+[profile.release]
+lto = "thin"

@@ -1,0 +1,232 @@
+//! SPARQL graph patterns: BGPs, OPTIONAL, UNION, MINUS, FILTER scoping,
+//! BIND, VALUES, GRAPH and datasets, subqueries, EXISTS.
+
+mod common;
+use common::*;
+use s_store::GraphRef;
+
+const PEOPLE: &str = r#"
+ex:alice ex:name "Alice" ; ex:knows ex:bob, ex:carol ; ex:age 30 .
+ex:bob   ex:name "Bob"   ; ex:knows ex:carol ; ex:age 25 ; ex:email "bob@ex" .
+ex:carol ex:name "Carol" ; ex:age 35 .
+ex:dave  ex:knows ex:alice .
+"#;
+
+fn people() -> s_store::Store {
+    store_with(PEOPLE)
+}
+
+#[test]
+fn single_pattern_with_constants() {
+    let st = people();
+    assert_eq!(select(&st, "SELECT ?n WHERE { ex:bob ex:name ?n }"), rows(&[&["\"Bob\""]]));
+    assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:knows ex:carol }"), rows(&[&["<http://ex/alice>"], &["<http://ex/bob>"]]));
+    assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:unknown ?o }"), rows(&[]));
+    assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:knows ex:nobody }"), rows(&[]));
+}
+
+#[test]
+fn star_and_chain_joins() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?a ?b WHERE { ?x ex:knows ?y . ?x ex:name ?a . ?y ex:name ?b }"),
+        rows(&[&["\"Alice\"", "\"Bob\""], &["\"Alice\"", "\"Carol\""], &["\"Bob\"", "\"Carol\""]])
+    );
+    assert_eq!(
+        select(&st, "SELECT ?z WHERE { ex:dave ex:knows ?x . ?x ex:knows ?y . ?y ex:knows ?z }"),
+        rows(&[&["<http://ex/carol>"]])
+    );
+}
+
+#[test]
+fn variable_predicates_join_with_other_positions() {
+    let st = store_with("ex:p ex:label \"P\" . ex:a ex:p ex:b . ex:a ex:label \"A\" .");
+    assert_eq!(select(&st, "SELECT ?l ?o WHERE { ?p ex:label ?l . ex:a ?p ?o }"), rows(&[&["\"P\"", "<http://ex/b>"]]));
+    assert_eq!(
+        select(&st, "SELECT ?p WHERE { ex:a ?p ?o }"),
+        rows(&[&["<http://ex/label>"], &["<http://ex/p>"]])
+    );
+}
+
+#[test]
+fn repeated_variables_within_a_pattern() {
+    let st = store_with("ex:a ex:p ex:a . ex:a ex:p ex:b .");
+    assert_eq!(select(&st, "SELECT ?x WHERE { ?x ex:p ?x }"), rows(&[&["<http://ex/a>"]]));
+}
+
+#[test]
+fn select_star_projects_in_order_of_appearance() {
+    let st = people();
+    assert_eq!(variables(&st, "SELECT * WHERE { ?s ex:age ?age }"), vec!["s", "age"]);
+    assert_eq!(select(&st, "SELECT * WHERE { ex:carol ex:age ?age }"), rows(&[&[&int(35)]]));
+}
+
+#[test]
+fn optional_keeps_unmatched_rows() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?n ?e WHERE { ?s ex:name ?n OPTIONAL { ?s ex:email ?e } }"),
+        rows(&[&["\"Alice\"", "-"], &["\"Bob\"", "\"bob@ex\""], &["\"Carol\"", "-"]])
+    );
+}
+
+#[test]
+fn optional_filter_is_a_join_condition() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?n ?o WHERE { ?s ex:name ?n OPTIONAL { ?s ex:knows ?o FILTER(?o != ex:bob) } }"),
+        rows(&[&["\"Alice\"", "<http://ex/carol>"], &["\"Bob\"", "<http://ex/carol>"], &["\"Carol\"", "-"]])
+    );
+}
+
+#[test]
+fn nested_optional_with_unbound_shared_variable() {
+    // The classic non-well-designed case: ?v is bound only in the inner
+    // OPTIONAL's right side and in the outer right side.
+    let st = store_with("ex:a ex:p 1 . ex:a ex:q 2 . ex:b ex:p 1 .");
+    let q = "SELECT ?s ?v WHERE { ?s ex:p 1 OPTIONAL { ?s ex:q ?v } }";
+    assert_eq!(select(&st, q), rows(&[&["<http://ex/a>", &int(2)], &["<http://ex/b>", "-"]]));
+}
+
+#[test]
+fn union_concatenates() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?x WHERE { { ex:alice ex:knows ?x } UNION { ?x ex:knows ex:alice } }"),
+        rows(&[&["<http://ex/bob>"], &["<http://ex/carol>"], &["<http://ex/dave>"]])
+    );
+    assert_eq!(select(&st, "SELECT ?x ?y WHERE { { ex:bob ex:email ?x } UNION { ex:carol ex:age ?y } }"), rows(&[&["\"bob@ex\"", "-"], &["-", &int(35)]]));
+}
+
+#[test]
+fn minus_removes_compatible_solutions() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?s WHERE { ?s ex:name ?n MINUS { ?s ex:email ?e } }"),
+        rows(&[&["<http://ex/alice>"], &["<http://ex/carol>"]])
+    );
+    // No shared variables: nothing is removed.
+    assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:age 25 MINUS { ?x ex:email ?e } }"), rows(&[&["<http://ex/bob>"]]));
+}
+
+#[test]
+fn filter_scope_is_the_group() {
+    let st = people();
+    assert_eq!(select(&st, "SELECT ?s WHERE { FILTER(?a > 26) ?s ex:age ?a }"), rows(&[&["<http://ex/alice>"], &["<http://ex/carol>"]]));
+    // A filter in an inner group cannot see the outer group's variables.
+    assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:age ?a { FILTER(bound(?a)) } }"), rows(&[]));
+}
+
+#[test]
+fn bind_extends_and_joins() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?s ?next WHERE { ?s ex:age ?a BIND(?a + 1 AS ?next) FILTER(?next > 30) }"),
+        rows(&[&["<http://ex/alice>", &int(31)], &["<http://ex/carol>", &int(36)]])
+    );
+    // A computed term that also exists in the data joins with it.
+    assert_eq!(select(&st, "SELECT ?s WHERE { BIND(ex:carol AS ?o) ?s ex:knows ?o }"), rows(&[&["<http://ex/alice>"], &["<http://ex/bob>"]]));
+}
+
+#[test]
+fn values_tables_join() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?s ?n WHERE { VALUES ?s { ex:alice ex:carol ex:nobody } ?s ex:name ?n }"),
+        rows(&[&["<http://ex/alice>", "\"Alice\""], &["<http://ex/carol>", "\"Carol\""]])
+    );
+    assert_eq!(
+        select(&st, "SELECT ?s ?a WHERE { ?s ex:age ?a } VALUES (?s ?a) { (ex:bob UNDEF) (UNDEF 35) }"),
+        rows(&[&["<http://ex/bob>", &int(25)], &["<http://ex/carol>", &int(35)]])
+    );
+}
+
+#[test]
+fn graph_patterns_and_named_graph_enumeration() {
+    let mut st = people();
+    load_ttl(&mut st, "ex:x ex:p ex:y .", GraphRef::Named("<http://ex/g1>"));
+    load_ttl(&mut st, "ex:x ex:p ex:z . ex:z ex:p ex:w .", GraphRef::Named("<http://ex/g2>"));
+    assert_eq!(select(&st, "SELECT ?g ?o WHERE { GRAPH ?g { ex:x ex:p ?o } }"), rows(&[&["<http://ex/g1>", "<http://ex/y>"], &["<http://ex/g2>", "<http://ex/z>"]]));
+    assert_eq!(select(&st, "SELECT ?o WHERE { GRAPH ex:g2 { ?s ex:p ?o } }"), rows(&[&["<http://ex/w>"], &["<http://ex/z>"]]));
+    // The default graph is not the union of the named graphs.
+    assert_eq!(select(&st, "SELECT ?o WHERE { ex:x ex:p ?o }"), rows(&[]));
+    // A join must stay within one graph.
+    assert_eq!(select(&st, "SELECT ?g ?w WHERE { GRAPH ?g { ex:x ex:p ?z . ?z ex:p ?w } }"), rows(&[&["<http://ex/g2>", "<http://ex/w>"]]));
+    // Graph variable bound beforehand.
+    assert_eq!(select(&st, "SELECT ?o WHERE { VALUES ?g { ex:g1 } GRAPH ?g { ex:x ex:p ?o } }"), rows(&[&["<http://ex/y>"]]));
+    assert_eq!(select(&st, "SELECT ?g WHERE { GRAPH ?g { } }"), rows(&[&["<http://ex/g1>"], &["<http://ex/g2>"]]));
+}
+
+#[test]
+fn from_clauses_define_the_dataset() {
+    let mut st = s_store::Store::new();
+    load_ttl(&mut st, "ex:x ex:p ex:y .", GraphRef::Named("<http://ex/g1>"));
+    load_ttl(&mut st, "ex:y ex:p ex:z .", GraphRef::Named("<http://ex/g2>"));
+    // FROM merges graphs into the default graph: joins cross them.
+    assert_eq!(select(&st, "SELECT ?z FROM ex:g1 FROM ex:g2 WHERE { ex:x ex:p ?y . ?y ex:p ?z }"), rows(&[&["<http://ex/z>"]]));
+    // FROM NAMED restricts the named graphs.
+    assert_eq!(select(&st, "SELECT ?g FROM NAMED ex:g2 WHERE { GRAPH ?g { ?s ?p ?o } }"), rows(&[&["<http://ex/g2>"]]));
+    // A duplicate triple across merged graphs is one triple.
+    load_ttl(&mut st, "ex:x ex:p ex:y .", GraphRef::Named("<http://ex/g2>"));
+    assert_eq!(select(&st, "SELECT ?y FROM ex:g1 FROM ex:g2 WHERE { ex:x ex:p ?y }"), rows(&[&["<http://ex/y>"]]));
+}
+
+#[test]
+fn subqueries_have_their_own_scope() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?s ?n WHERE { ?s ex:name ?n { SELECT ?s WHERE { ?s ex:age ?n } } }"),
+        rows(&[&["<http://ex/alice>", "\"Alice\""], &["<http://ex/bob>", "\"Bob\""], &["<http://ex/carol>", "\"Carol\""]]),
+        "the inner ?n is a different variable"
+    );
+    assert_eq!(
+        select(&st, "SELECT ?s WHERE { ?s ex:name ?n { SELECT ?s WHERE { ?s ex:age ?a } ORDER BY DESC(?a) LIMIT 1 } }"),
+        rows(&[&["<http://ex/carol>"]])
+    );
+}
+
+#[test]
+fn exists_and_not_exists_substitute_the_current_row() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?s WHERE { ?s ex:name ?n FILTER EXISTS { ?s ex:knows ?o } }"),
+        rows(&[&["<http://ex/alice>"], &["<http://ex/bob>"]])
+    );
+    assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:name ?n FILTER NOT EXISTS { ?x ex:knows ?s } }"), rows(&[]));
+    assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:knows ?o FILTER NOT EXISTS { ?o ex:knows ?z } }"), rows(&[&["<http://ex/alice>"], &["<http://ex/bob>"]]));
+}
+
+#[test]
+fn ask_queries() {
+    let st = people();
+    assert!(ask(&st, "ASK { ex:alice ex:knows ex:bob }"));
+    assert!(!ask(&st, "ASK { ex:bob ex:knows ex:alice }"));
+    assert!(ask(&st, "ASK { }"));
+}
+
+#[test]
+fn construct_and_describe() {
+    let st = people();
+    assert_eq!(
+        construct(&st, "CONSTRUCT { ?y ex:knownBy ?x } WHERE { ?x ex:knows ?y FILTER(?x = ex:alice) }"),
+        vec!["<http://ex/bob> <http://ex/knownBy> <http://ex/alice>", "<http://ex/carol> <http://ex/knownBy> <http://ex/alice>"]
+    );
+    // Unbound or invalid template triples are skipped; duplicates collapse.
+    assert_eq!(construct(&st, "CONSTRUCT { ?s ex:mail ?e } WHERE { ?s ex:name ?n OPTIONAL { ?s ex:email ?e } }"), vec!["<http://ex/bob> <http://ex/mail> \"bob@ex\""]);
+    let blanks = construct(&st, "CONSTRUCT { [] ex:about ?s } WHERE { ?s ex:age ?a }");
+    assert_eq!(blanks.len(), 3, "a fresh blank node per solution");
+    assert_eq!(construct(&st, "DESCRIBE ex:carol").len(), 2);
+}
+
+#[test]
+fn property_graph_data_is_queryable_but_kept_out_of_rdf_answers() {
+    use s_store::property::Owner;
+    let mut st = people();
+    st.properties_mut().set(Owner::Edge("<http://ex/alice>", "<http://ex/knows>", "<http://ex/bob>"), "<http://ex/since>", "\"2020\"").unwrap();
+    load_ttl(&mut st, "ex:x ex:p ex:y .", GraphRef::Named("<http://ex/g1>"));
+    assert_eq!(select(&st, "SELECT ?g WHERE { GRAPH ?g { } }"), rows(&[&["<http://ex/g1>"]]));
+    assert_eq!(
+        select(&st, "SELECT ?since WHERE { GRAPH <urn:x-s-store:properties> { ?edge ex:since ?since } }"),
+        rows(&[&["\"2020\""]])
+    );
+}
