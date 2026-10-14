@@ -61,6 +61,17 @@ pub enum JoinMode {
     Materialize { key: Option<Slot> },
 }
 
+/// What a [`Node::SetJoin`] makes of the left solutions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetJoinKind {
+    /// `FILTER EXISTS`: left solutions with a match.
+    Semi,
+    /// `FILTER NOT EXISTS`, `MINUS`: left solutions without one.
+    Anti,
+    /// `OPTIONAL`: the joined solutions, then left solutions without a match.
+    LeftOuter,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Node {
     /// One empty solution.
@@ -76,6 +87,22 @@ pub enum Node {
     Union(NodeId, NodeId),
     Minus(NodeId, NodeId),
     Graph(PTerm, NodeId),
+    /// The solutions of `input` for which every pattern of `triples` (range
+    /// into `Plan::triples`), with the solution substituted, is in the
+    /// active graph — or, when `negated`, not every one is. Every variable
+    /// of `triples` is certainly bound by `input`, so each check is a set
+    /// of point lookups, run in batches (s-graph `contains_batch`). It is
+    /// what `FILTER EXISTS`, `FILTER NOT EXISTS`, `MINUS` and joins compile
+    /// to when their pattern is fully bound by the left side.
+    Check { input: NodeId, triples: Range, negated: bool },
+    /// A left BGP `left` and a right BGP sharing exactly one variable,
+    /// `slot`, which both certainly bind: whether a left solution has a
+    /// match depends on its `slot` value alone. `joined` (range into
+    /// `Plan::triples`) is both BGPs' patterns: one native s-graph join
+    /// records the matching `slot` values in an id set (and, for
+    /// [`SetJoinKind::LeftOuter`], emits the joined solutions); a second
+    /// pass over `left` then keeps or adds solutions by membership.
+    SetJoin { left: NodeId, joined: Range, slot: Slot, kind: SetJoinKind },
     Filter(ExprId, NodeId),
     Extend(NodeId, Slot, ExprId),
     /// `keys` ranges over `Plan::group_keys`, `aggregates` over

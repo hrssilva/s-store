@@ -163,6 +163,21 @@ impl<S: BlockStorage> Store<S> {
         self.lookup_quad(graph, s, p, o).is_some_and(|(g, s, p, o)| self.quads.contains(g, s, p, o))
     }
 
+    /// [`Self::contains`] for each `(s, p, o)` key triple of `quads` in
+    /// `graph`, into `out` in input order, checked in one batched descent.
+    pub fn contains_batch(&self, graph: GraphRef<'_>, quads: &[(&str, &str, &str)], out: &mut Vec<bool>) {
+        let Some(g) = self.lookup_graph(graph) else {
+            out.clear();
+            out.resize(quads.len(), false);
+            return;
+        };
+        // A key missing from the dictionary becomes `u32::MAX`, above the
+        // dictionary's id limit, so its probe misses.
+        let id = |k: &str| self.dict.lookup(k).unwrap_or(TermId(u32::MAX));
+        let ids: Vec<(TermId, TermId, TermId)> = quads.iter().map(|&(s, p, o)| (id(s), id(p), id(o))).collect();
+        self.quads.contains_batch_into(g, &ids, &mut Vec::with_capacity(ids.len()), out);
+    }
+
     fn lookup_quad(&self, graph: GraphRef<'_>, s: &str, p: &str, o: &str) -> Option<(GraphName, TermId, TermId, TermId)> {
         Some((self.lookup_graph(graph)?, self.dict.lookup(s)?, self.dict.lookup(p)?, self.dict.lookup(o)?))
     }
@@ -246,6 +261,21 @@ mod tests {
         assert!(st.remove(G, "<a>", "<p>", "\"x\""));
         assert!(!st.remove(G, "<a>", "<p>", "\"x\""));
         assert_eq!(st.len(), 1);
+    }
+
+    #[test]
+    fn batched_contains_by_key() {
+        let mut st = Store::new();
+        st.insert(GraphRef::Default, "<http://a>", "<http://p>", "\"x\"").unwrap();
+        st.insert(GraphRef::Named("<http://g>"), "<http://a>", "<http://p>", "<http://b>").unwrap();
+        let quads = [("<http://a>", "<http://p>", "\"x\""), ("<http://a>", "<http://p>", "<http://b>"), ("<http://a>", "<http://unknown>", "\"x\"")];
+        let mut out = Vec::new();
+        st.contains_batch(GraphRef::Default, &quads, &mut out);
+        assert_eq!(out, vec![true, false, false]);
+        st.contains_batch(GraphRef::Named("<http://g>"), &quads, &mut out);
+        assert_eq!(out, vec![false, true, false]);
+        st.contains_batch(GraphRef::Named("<http://nowhere>"), &quads, &mut out);
+        assert_eq!(out, vec![false; 3]);
     }
 
     #[test]

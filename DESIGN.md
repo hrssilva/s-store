@@ -55,6 +55,26 @@ A quad `(g, s, p, o)` is the triple `(s, p', o)` in graph `g`'s tree.
 - **Bulk load into an empty graph** collects id triples (12 B each) and
   bulk-builds once; loads into non-empty graphs use Morton-sorted
   `insert_batch` per dictionary batch.
+- **Term-order ids after a fresh load**: when the dictionary was empty
+  before a load (so nothing else holds an id: graph names, predicate
+  table, other partitions), the loader renumbers it to term order
+  (`Dictionary::renumber_term_order`, s-dict's `renumber`) and remaps the
+  collected triples and the target graph name before the bulk build. Ids
+  become term ranks, independent of batching and worker count. On the
+  36M-triple s-bench file the store shrinks from 157 to 119 MiB (graph 127
+  -> 93 MiB: term order compresses better than first-seen order;
+  dictionary -15%, one id run per block) for 0.18 s of renumbering
+  (sequential load 52.0 s either way, measured interleaved). A load into a
+  non-empty store keeps first-seen ids.
+- **Parallel N-Triples load** (`load::load_parallel`): worker threads parse
+  line-aligned byte ranges and prepare (sort and group) their own batches;
+  the calling thread only interns them and collects triples, taking one
+  batch per worker in turn. Arrival order would scatter related terms'
+  ids (graph +6%, a 4-row chain 0.09 -> 6.4 ms on the s-bench file), which
+  the term-order renumbering above undoes. 7 workers load that file in
+  ~26-29 s vs ~49-52 s sequentially (interning is then the bottleneck).
+  Turtle can't be split at arbitrary lines (prefixes, multi-line
+  statements) and stays sequential.
 - **Trade-off**: fixed cost per graph (tree metadata + first block). Fine for
   datasets with a moderate number of graphs; "one graph per statement" data
   would want a different partitioning (e.g. graph id folded into a dimension).
@@ -107,6 +127,49 @@ checked against the left side's certainly-bound variables. Otherwise the right
 side is materialized once (per active graph), sorted on a key bound on both
 sides, and probed by binary search.
 
+**Batched existence checks** (`Node::Check`): a FILTER EXISTS / NOT EXISTS,
+MINUS or join whose right side is a BGP with every variable certainly bound
+by the left side is only point lookups once a left solution is substituted.
+The compiler rewrites it to `Check`; the executor buffers left solutions
+(4096 at a time, buffers pooled per query), probes all their patterns with
+one s-graph `contains_batch` per graph, and passes the survivors on in their
+original order. s-graph sorts the probes and shares descents, which matters
+because one `contains` re-descends from the root, skipping siblings one by
+one (µs per lookup on large trees). Measured ~10× over per-row evaluation.
+Scans of a merged default graph check later graphs' triples against the
+earlier graphs the same way, in batches after the first 64 triples (short
+scans stay allocation-free). `QuadIndex::contains_batch_into` and
+`Store::contains_batch` expose the same operation.
+
+**Set joins** (`Node::SetJoin`): OPTIONAL (without a join condition),
+FILTER EXISTS / NOT EXISTS and MINUS between two BGPs that share exactly one
+variable, certainly bound by both, decide each left solution by that one
+value. The compiler concatenates both BGPs; the executor runs them as one
+native s-graph join, records the shared variable's values in an id set
+(`sparql::idset`: one bit per dictionary id, zero pages until written,
+cleared by touched words, pooled per query), passes the joined solutions on
+for an OPTIONAL, then evaluates the left BGP once more and keeps, drops or
+adds solutions by membership. Two s-graph traversals and no per-row lookup,
+hashing or materialized right side: on a 20M-triple synthetic file the
+benchmark's OPTIONAL / NOT EXISTS / MINUS went from 110-127 s (MINUS:
+quadratic) to ~0.21 s, about the cost of the inner join plus a left scan.
+The joined pass runs to completion before the left pass, so a LIMIT or ASK
+over a set join still pays the whole join. Several shared variables keep
+the earlier strategies (`Check`, bind or materialize).
+
+**Counting** (`group::count_shape`): a GROUP over one triple pattern (no
+repeated variable) whose aggregates are all `COUNT(*)`, `COUNT(DISTINCT *)`
+or `COUNT(?v)` of a pattern variable, grouped by nothing or by the pattern's
+predicate variable, produces no solutions: an all-variable pattern is the
+graph's size, any other is s-graph's `count_matching` (leaf words counted by
+popcount), and GROUP BY ?p counts once per dense predicate, skipping zero
+counts. A merged default graph (shared triples would count twice) or an
+already-bound grouping predicate falls back to ordinary grouping. On the
+500k-subject synthetic file: COUNT of everything 318 ms → 0.01 ms, of one
+class 18.5 → 0.75 ms, of the busiest predicate 195 → 68 ms, the predicate
+histogram 352 → 234 ms (one traversal per predicate; a single traversal
+counting all predicates at once would need s-graph support).
+
 **Expressions** use `Copy` values over one per-query text arena: constants
 are decoded once into a frozen prefix; per-row scratch is truncated after each
 evaluation. ORDER BY decodes each *distinct* key term once and sorts rows by
@@ -128,6 +191,8 @@ per-row key allocation.
 - Decimals are `f64` (no arbitrary precision); MD5/SHA*, SPARQL Update,
   SERVICE, RDF/XML and JSON-LD are not implemented; DESCRIBE returns the
   resource's outgoing triples (no blank-node closure).
+- MINUS outside the set-join and check cases still materializes its right
+  side without a key, so it compares every left row with every right row.
 - Aggregates skip unbound inputs (Jena/RDF4J behaviour); bound values of the
   wrong type still make SUM/AVG an error.
 - No persistence of the whole store yet (s-dict and s-graph can each

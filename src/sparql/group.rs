@@ -9,6 +9,8 @@
 //! each id by its rank: the row sort itself compares integers, never terms.
 
 use super::exec::{Active, CONTINUE, Ctx, Env, Flow, Sink};
+use super::path::View;
+use crate::graph::Partition;
 use super::expr::{term_value, value_id};
 use super::hash::RowSet;
 use super::plan::*;
@@ -51,11 +53,108 @@ fn add(a: Num, b: Num) -> Option<Num> {
     }
 }
 
+/// A GROUP s-graph can count without listing the matches: the input is one
+/// triple pattern without a repeated variable, every aggregate is `COUNT(*)`,
+/// `COUNT(DISTINCT *)` (a pattern's matches are a set) or `COUNT(?v)` of a
+/// variable of the pattern (always bound), and the grouping is none or the
+/// pattern's predicate variable alone.
+struct CountShape {
+    triple: PTriple,
+    by_predicate: bool,
+}
+
+fn count_shape(plan: &Plan, input: NodeId, keys: &[GroupKey], aggs: &[Aggregate]) -> Option<CountShape> {
+    let Node::Bgp(r) = plan.node(input) else { return None };
+    let [triple] = plan.triples(r) else { return None };
+    let vars: Vec<Slot> = [triple.s, triple.p, triple.o].into_iter().filter_map(|t| if let PTerm::Var(v) = t { Some(v) } else { None }).collect();
+    if (1..vars.len()).any(|i| vars[..i].contains(&vars[i])) {
+        return None;
+    }
+    let countable = |a: &Aggregate| {
+        a.kind == AggKind::Count
+            && match a.expr {
+                None => true,
+                Some(e) => !a.distinct && matches!(plan.expr(e), Expr::Var(v) if vars.contains(&v)),
+            }
+    };
+    if !aggs.iter().all(countable) {
+        return None;
+    }
+    let by_predicate = match keys {
+        [] => false,
+        [key] => matches!((plan.expr(key.expr), triple.p), (Expr::Var(k), PTerm::Var(p)) if k == p),
+        _ => return None,
+    };
+    (keys.is_empty() || by_predicate).then_some(CountShape { triple: *triple, by_predicate })
+}
+
 impl<S: BlockStorage> Ctx<'_, S> {
+    /// GROUP via s-graph's counting traversal (see [`CountShape`]): no
+    /// solution is produced, only counts. The graph's size answers an
+    /// all-variable pattern; a GROUP BY of the predicate counts once per
+    /// predicate. `None` when the active graph is a merge (whose counts
+    /// would double-count shared triples) or the grouping predicate is
+    /// already bound: the caller then groups solutions as usual.
+    #[allow(clippy::too_many_arguments)]
+    fn count_group(&self, env: &mut Env, shape: &CountShape, keys: &[GroupKey], aggs: &[Aggregate], active: Active, row: &mut [u32], k: &mut Sink<'_>) -> Option<Flow> {
+        let part = match self.view(active) {
+            View::Empty => None,
+            View::One(part) => Some(part),
+            View::Merged(_) => return None,
+        };
+        let resolved = part.and_then(|part| Some((part, self.pattern_bounds(&shape.triple, row)?)));
+        let count = |part: &Partition<S>, bounds: [Option<u32>; 3]| if bounds == [None; 3] { part.len() } else { part.tree().count_matching(bounds) };
+        let counts = |n: u64| aggs.iter().map(|_| Acc::Count(n as i64)).collect::<Vec<_>>();
+        if !shape.by_predicate {
+            let n = resolved.map_or(0, |(part, bounds)| count(part, bounds));
+            return Some(self.emit_group(env, &[], &counts(n), keys, aggs, row, k));
+        }
+        if resolved.is_some_and(|(_, bounds)| bounds[1].is_some()) {
+            return None;
+        }
+        let Some((part, mut bounds)) = resolved else { return Some(CONTINUE) };
+        for dense in 0..self.store.index().predicates().terms().len() as u32 {
+            bounds[1] = Some(dense);
+            let n = count(part, bounds);
+            if n > 0 {
+                let flow = self.emit_group(env, &[self.predicate_term(dense)], &counts(n), keys, aggs, row, k);
+                if flow.is_break() {
+                    return Some(flow);
+                }
+            }
+        }
+        Some(CONTINUE)
+    }
+
+    /// Binds one group's keys and aggregate results and calls `k`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_group(&self, env: &mut Env, key_values: &[u32], accs: &[Acc], keys: &[GroupKey], aggs: &[Aggregate], row: &mut [u32], k: &mut Sink<'_>) -> Flow {
+        let mut newly: Vec<Slot> = Vec::with_capacity(keys.len() + aggs.len());
+        let mut compatible = true;
+        for (gk, &v) in keys.iter().zip(key_values) {
+            if let (Some(slot), true) = (gk.slot, v != UNBOUND) {
+                compatible &= set(row, slot, v, &mut newly);
+            }
+        }
+        for (agg, acc) in aggs.iter().zip(accs) {
+            if let Some(v) = self.finish(env, acc, agg) {
+                compatible &= set(row, agg.out, v, &mut newly);
+            }
+        }
+        let flow = if compatible { k(env, row) } else { CONTINUE };
+        newly.iter().for_each(|&s| row[s as usize] = UNBOUND);
+        flow
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn group(&self, env: &mut Env, input: NodeId, keys: Range, aggregates: Range, active: Active, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
         let keys = &self.plan.group_keys[keys.indices()];
         let aggs = &self.plan.aggregates[aggregates.indices()];
+        if let Some(shape) = count_shape(self.plan, input, keys, aggs)
+            && let Some(flow) = self.count_group(env, &shape, keys, aggs, active, row, k)
+        {
+            return flow;
+        }
         let input_scope = self.plan.scope(input);
         let mut groups = RowSet::new(keys.len());
         let mut accs: Vec<Acc> = Vec::new();
@@ -95,24 +194,9 @@ impl<S: BlockStorage> Ctx<'_, S> {
             groups.insert(&[]);
             accs.extend(aggs.iter().map(|a| Acc::new(a.kind)));
         }
-        let mut newly: Vec<Slot> = Vec::with_capacity(keys.len() + aggs.len());
-        for g in 0..groups.len() as u32 {
-            newly.clear();
-            let mut compatible = true;
-            for (i, gk) in keys.iter().enumerate() {
-                let v = groups.row(g)[i];
-                if let (Some(slot), true) = (gk.slot, v != UNBOUND) {
-                    compatible &= set(row, slot, v, &mut newly);
-                }
-            }
-            for (j, agg) in aggs.iter().enumerate() {
-                if let Some(v) = self.finish(env, &accs[g as usize * aggs.len() + j], agg) {
-                    compatible &= set(row, agg.out, v, &mut newly);
-                }
-            }
-            let flow = if compatible { k(env, row) } else { CONTINUE };
-            newly.iter().for_each(|&s| row[s as usize] = UNBOUND);
-            flow?;
+        for g in 0..groups.len() {
+            let accs = &accs[g * aggs.len()..(g + 1) * aggs.len()];
+            self.emit_group(env, groups.row(g as u32), accs, keys, aggs, row, k)?;
         }
         CONTINUE
     }
@@ -292,5 +376,49 @@ fn set(row: &mut [u32], slot: Slot, v: u32, newly: &mut Vec<Slot>) -> bool {
         true
     } else {
         *cell == v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+    use crate::sparql::compile::compile;
+    use crate::sparql::locals::LocalTerms;
+    use crate::sparql::value::Arena;
+
+    /// The count shape of the plan's (first) GROUP node, as
+    /// (grouped by predicate, the pattern).
+    fn shape(text: &str) -> Option<bool> {
+        let query = s_parser::parse_query(text.as_bytes()).unwrap();
+        let plan = compile(&Store::new(), &query, &mut LocalTerms::new(), &mut Arena::new()).unwrap();
+        let (input, keys, aggregates) = plan.nodes.iter().find_map(|n| match *n {
+            Node::Group { input, keys, aggregates } => Some((input, keys, aggregates)),
+            _ => None,
+        })?;
+        count_shape(&plan, input, &plan.group_keys[keys.indices()], &plan.aggregates[aggregates.indices()]).map(|s| s.by_predicate)
+    }
+
+    #[test]
+    fn single_pattern_counts_are_countable() {
+        assert_eq!(shape("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }"), Some(false));
+        assert_eq!(shape("SELECT (COUNT(?o) AS ?n) (COUNT(DISTINCT *) AS ?d) WHERE { ?s <http://p> ?o }"), Some(false));
+        assert_eq!(shape("SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p"), Some(true));
+    }
+
+    #[test]
+    fn other_aggregates_and_groupings_are_not() {
+        for q in [
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o . ?o ?p ?z }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?s }",
+            "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o }",
+            "SELECT (COUNT(?x) AS ?n) WHERE { ?s ?p ?o }",
+            "SELECT (SUM(?o) AS ?n) WHERE { ?s ?p ?o }",
+            "SELECT ?s (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?s",
+            "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p ?s",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(?o != ?s) }",
+        ] {
+            assert_eq!(shape(q), None, "{q}");
+        }
     }
 }

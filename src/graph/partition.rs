@@ -77,6 +77,13 @@ impl<S: BlockStorage> Partition<S> {
         self.tree.contains(s, p, o)
     }
 
+    /// [`Self::contains`] for every triple of `triples`, into `out` in input
+    /// order. s-graph sorts the probes and shares descents between them, so
+    /// this is far cheaper than one `contains` per triple.
+    pub fn contains_batch_into(&self, triples: &[Triple], out: &mut Vec<bool>) {
+        self.tree.contains_batch_into(triples, out);
+    }
+
     /// Matching triples in the tree's Morton order; `None` is a wildcard.
     pub fn scan(&self, bounds: [Option<u32>; 3]) -> Scan<'_, S> {
         self.tree.scan(bounds)
@@ -162,6 +169,17 @@ mod tests {
         assert!(!p.remove(1, 0, 2));
         assert!(!p.contains(1, 0, 2));
         assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn batched_contains_answers_in_input_order() {
+        let p = P::from_triples(vec![(1, 0, 2), (2, 1, 1), (7, 0, 3)], 4096);
+        let probes = [(7, 0, 3), (1, 0, 3), (1, 0, 2), (1, 0, 2), (u32::MAX, 0, 2), (2, u32::MAX, 1)];
+        let mut out = vec![true; 10];
+        p.contains_batch_into(&probes, &mut out);
+        assert_eq!(out, vec![true, false, true, true, false, false], "duplicates repeat, out-of-domain is absent");
+        p.contains_batch_into(&[], &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

@@ -196,6 +196,122 @@ fn exists_and_not_exists_substitute_the_current_row() {
     assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:knows ?o FILTER NOT EXISTS { ?o ex:knows ?z } }"), rows(&[&["<http://ex/alice>"], &["<http://ex/bob>"]]));
 }
 
+/// Fully bound EXISTS / NOT EXISTS / MINUS / join patterns are checked in
+/// batches; these exercise batch boundaries, early stops and graphs.
+#[test]
+fn batched_existence_checks_match_row_by_row_semantics() {
+    let mut ttl = String::new();
+    for i in 0..5000 {
+        ttl.push_str(&format!("ex:n{i} ex:next ex:n{} .\n", i + 1));
+        if i % 3 == 0 {
+            ttl.push_str(&format!("ex:n{} ex:back ex:n{i} .\n", i + 1));
+        }
+    }
+    let st = store_with(&ttl);
+    let count = |q: &str| select(&st, &format!("SELECT (COUNT(*) AS ?n) WHERE {{ {q} }}"))[0][0].clone().unwrap();
+    assert_eq!(count("?a ex:next ?b FILTER EXISTS { ?b ex:back ?a }"), int(1667));
+    assert_eq!(count("?a ex:next ?b FILTER NOT EXISTS { ?b ex:back ?a }"), int(3333));
+    assert_eq!(count("?a ex:next ?b MINUS { ?b ex:back ?a }"), int(3333));
+    assert_eq!(count("?a ex:next ?b OPTIONAL { ?a ex:none ?z } ?b ex:back ?a"), int(1667));
+    assert_eq!(count("?a ex:next ?b FILTER NOT EXISTS { ?b ex:back ?a . ?a ex:next ex:n1 }"), int(4999));
+    assert_eq!(count("?a ex:next ?b FILTER EXISTS { ?b ex:back ?a . ?a ex:next \"not in the data\" }"), int(0));
+    assert_eq!(count("?a ex:next ?b FILTER EXISTS { ?b ex:unknown ?a }"), int(0));
+    assert_eq!(
+        select_ordered(&st, "SELECT ?a WHERE { VALUES ?a { ex:n0 ex:n1 ex:n3 ex:n6 } ?a ex:next ?b FILTER EXISTS { ?b ex:back ?a } } LIMIT 2"),
+        ordered_rows(&[&["<http://ex/n0>"], &["<http://ex/n3>"]]),
+        "order is kept and LIMIT stops"
+    );
+    assert!(ask(&st, "ASK { ?a ex:next ?b FILTER EXISTS { ?b ex:back ?a } }"));
+}
+
+#[test]
+fn batched_existence_checks_use_the_active_graph() {
+    let mut st = s_store::Store::new();
+    load_ttl(&mut st, "ex:a ex:p ex:b . ex:c ex:p ex:d .", GraphRef::Named("<http://ex/g1>"));
+    load_ttl(&mut st, "ex:a ex:p ex:b . ex:b ex:q ex:a .", GraphRef::Named("<http://ex/g2>"));
+    load_ttl(&mut st, "ex:d ex:q ex:c .", GraphRef::Named("<http://ex/g3>"));
+    assert_eq!(
+        select(&st, "SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:p ?o FILTER EXISTS { ?o ex:q ?s } } }"),
+        rows(&[&["<http://ex/g2>", "<http://ex/a>"]])
+    );
+    assert_eq!(
+        select(&st, "SELECT ?s FROM ex:g1 FROM ex:g3 WHERE { ?s ex:p ?o FILTER EXISTS { ?o ex:q ?s } }"),
+        rows(&[&["<http://ex/c>"]]),
+        "a merged default graph holds a triple if any of its graphs does"
+    );
+}
+
+/// OPTIONAL / EXISTS / NOT EXISTS / MINUS sharing one variable run as a
+/// native join plus an id set; these pin their bag semantics.
+const SHARED: &str = r#"
+ex:a ex:p ex:o1, ex:o2 ; ex:q ex:v1, ex:v2 .
+ex:b ex:p ex:o1, ex:o3 .
+ex:c ex:p ex:o4 ; ex:q ex:v3 .
+ex:d ex:q ex:v4 .
+"#;
+
+#[test]
+fn set_joins_keep_bag_semantics() {
+    let st = store_with(SHARED);
+    assert_eq!(
+        select(&st, "SELECT ?s ?o ?v WHERE { ?s ex:p ?o OPTIONAL { ?s ex:q ?v } }"),
+        rows(&[
+            &["<http://ex/a>", "<http://ex/o1>", "<http://ex/v1>"],
+            &["<http://ex/a>", "<http://ex/o1>", "<http://ex/v2>"],
+            &["<http://ex/a>", "<http://ex/o2>", "<http://ex/v1>"],
+            &["<http://ex/a>", "<http://ex/o2>", "<http://ex/v2>"],
+            &["<http://ex/b>", "<http://ex/o1>", "-"],
+            &["<http://ex/b>", "<http://ex/o3>", "-"],
+            &["<http://ex/c>", "<http://ex/o4>", "<http://ex/v3>"],
+        ])
+    );
+    let left = |s: &str, o: &str| vec![Some(format!("<http://ex/{s}>")), Some(format!("<http://ex/{o}>"))];
+    let matched = {
+        let mut v = vec![left("a", "o1"), left("a", "o2"), left("c", "o4")];
+        v.sort();
+        v
+    };
+    let unmatched = vec![left("b", "o1"), left("b", "o3")];
+    assert_eq!(select(&st, "SELECT ?s ?o WHERE { ?s ex:p ?o FILTER EXISTS { ?s ex:q ?v } }"), matched, "each left row once");
+    assert_eq!(select(&st, "SELECT ?s ?o WHERE { ?s ex:p ?o FILTER NOT EXISTS { ?s ex:q ?v } }"), unmatched);
+    assert_eq!(select(&st, "SELECT ?s ?o WHERE { ?s ex:p ?o MINUS { ?s ex:q ?v } }"), unmatched);
+    assert_eq!(select(&st, "SELECT ?s ?o WHERE { ?s ex:p ?o FILTER NOT EXISTS { ?s ex:q ?v . ?v ex:q ?w } }").len(), 5);
+    assert_eq!(select_ordered(&st, "SELECT ?s WHERE { ?s ex:p ?o OPTIONAL { ?s ex:q ?v } } LIMIT 3").len(), 3);
+    assert!(ask(&st, "ASK { ?s ex:p ?o FILTER NOT EXISTS { ?s ex:q ?v } }"));
+}
+
+#[test]
+fn set_joins_reset_between_evaluations() {
+    let mut st = store_with(SHARED);
+    load_ttl(&mut st, "ex:a ex:p ex:o1 . ex:b ex:p ex:o1 ; ex:q ex:v9 .", GraphRef::Named("<http://ex/g1>"));
+    load_ttl(&mut st, "ex:a ex:p ex:o1 ; ex:q ex:v8 . ex:b ex:p ex:o1 .", GraphRef::Named("<http://ex/g2>"));
+    assert_eq!(
+        select(&st, "SELECT ?g ?s ?v WHERE { GRAPH ?g { ?s ex:p ?o OPTIONAL { ?s ex:q ?v } } }"),
+        rows(&[
+            &["<http://ex/g1>", "<http://ex/a>", "-"],
+            &["<http://ex/g1>", "<http://ex/b>", "<http://ex/v9>"],
+            &["<http://ex/g2>", "<http://ex/a>", "<http://ex/v8>"],
+            &["<http://ex/g2>", "<http://ex/b>", "-"],
+        ]),
+        "each graph gets its own id set"
+    );
+    assert_eq!(
+        select(&st, "SELECT ?g ?s WHERE { GRAPH ?g { ?s ex:p ?o MINUS { ?s ex:q ?v } } }"),
+        rows(&[&["<http://ex/g1>", "<http://ex/a>"], &["<http://ex/g2>", "<http://ex/b>"]])
+    );
+    // Re-evaluated once per outer row, with ?o substituted.
+    load_ttl(&mut st, "ex:r ex:t ex:o1, ex:o4 .", GraphRef::Default);
+    assert_eq!(
+        select(&st, "SELECT ?x ?s ?v WHERE { ex:r ex:t ?x { ?s ex:p ?x OPTIONAL { ?s ex:q ?v } } }"),
+        rows(&[
+            &["<http://ex/o1>", "<http://ex/a>", "<http://ex/v1>"],
+            &["<http://ex/o1>", "<http://ex/a>", "<http://ex/v2>"],
+            &["<http://ex/o1>", "<http://ex/b>", "-"],
+            &["<http://ex/o4>", "<http://ex/c>", "<http://ex/v3>"],
+        ])
+    );
+}
+
 #[test]
 fn ask_queries() {
     let st = people();

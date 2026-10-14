@@ -145,9 +145,9 @@ impl<S: BlockStorage> Copy for View<'_, S> {}
 impl<'a, S: BlockStorage> View<'a, S> {
     pub fn scan(self, bounds: [Option<u32>; 3]) -> ViewScan<'a, S> {
         match self {
-            View::Empty => ViewScan { parts: &[], index: 0, current: None, bounds },
-            View::One(p) => ViewScan { parts: &[], index: 0, current: Some(p.scan(bounds)), bounds },
-            View::Merged(parts) => ViewScan { parts, index: 0, current: None, bounds },
+            View::Empty => ViewScan::new(&[], None, bounds),
+            View::One(p) => ViewScan::new(&[], Some(p.scan(bounds)), bounds),
+            View::Merged(parts) => ViewScan::new(parts, None, bounds),
         }
     }
 
@@ -158,15 +158,59 @@ impl<'a, S: BlockStorage> View<'a, S> {
             View::Merged(parts) => parts.iter().any(|part| part.contains(s, p, o)),
         }
     }
+
+    /// [`Self::contains`] for every probe, into `out` in input order, with
+    /// one batched s-graph descent per graph; `scratch` holds a merged
+    /// view's per-graph answers.
+    pub fn contains_batch_into(self, probes: &[Triple], out: &mut Vec<bool>, scratch: &mut Vec<bool>) {
+        match self {
+            View::Empty => {
+                out.clear();
+                out.resize(probes.len(), false);
+            }
+            View::One(part) => part.contains_batch_into(probes, out),
+            View::Merged(parts) => {
+                out.clear();
+                out.resize(probes.len(), false);
+                for part in parts {
+                    part.contains_batch_into(probes, scratch);
+                    out.iter_mut().zip(scratch.iter()).for_each(|(hit, &found)| *hit |= found);
+                }
+            }
+        }
+    }
 }
 
+/// Triples of a later merged graph checked one by one before switching to
+/// batches: short scans (the common bound lookups) never allocate.
+const SINGLE_CHECKS: usize = 64;
+
+/// Triples of a later merged graph checked against the earlier ones per
+/// s-graph `contains_batch` call.
+const DEDUP_BATCH: usize = 4096;
+
 /// Scans each partition in turn; in a merged view, a triple is skipped when
-/// an earlier partition holds it too.
+/// an earlier partition holds it too. Past [`SINGLE_CHECKS`] triples of one
+/// graph, that check runs in batches of [`DEDUP_BATCH`].
 pub struct ViewScan<'a, S: BlockStorage> {
     parts: &'a [&'a Partition<S>],
     index: usize,
     current: Option<Scan<'a, S>>,
     bounds: [Option<u32>; 3],
+    /// Triples of the current graph checked singly so far.
+    singles: usize,
+    /// A checked batch: its triples, which an earlier graph holds, and the
+    /// next one to yield.
+    pending: Vec<Triple>,
+    held: Vec<bool>,
+    scratch: Vec<bool>,
+    next: usize,
+}
+
+impl<'a, S: BlockStorage> ViewScan<'a, S> {
+    fn new(parts: &'a [&'a Partition<S>], current: Option<Scan<'a, S>>, bounds: [Option<u32>; 3]) -> Self {
+        Self { parts, index: 0, current, bounds, singles: 0, pending: Vec::new(), held: Vec::new(), scratch: Vec::new(), next: 0 }
+    }
 }
 
 impl<S: BlockStorage> Iterator for ViewScan<'_, S> {
@@ -174,17 +218,41 @@ impl<S: BlockStorage> Iterator for ViewScan<'_, S> {
 
     fn next(&mut self) -> Option<Triple> {
         loop {
+            while self.next < self.pending.len() {
+                let i = self.next;
+                self.next += 1;
+                if !self.held[i] {
+                    return Some(self.pending[i]);
+                }
+            }
             if let Some(scan) = &mut self.current {
-                for t in scan.by_ref() {
-                    let earlier = &self.parts[..self.index.saturating_sub(1)];
-                    if !earlier.iter().any(|p| p.contains(t.0, t.1, t.2)) {
+                let earlier = &self.parts[..self.index.saturating_sub(1)];
+                if earlier.is_empty() {
+                    if let Some(t) = scan.next() {
                         return Some(t);
+                    }
+                } else if self.singles < SINGLE_CHECKS {
+                    if let Some(t) = scan.next() {
+                        self.singles += 1;
+                        if !earlier.iter().any(|p| p.contains(t.0, t.1, t.2)) {
+                            return Some(t);
+                        }
+                        continue;
+                    }
+                } else {
+                    self.pending.clear();
+                    self.pending.extend(scan.by_ref().take(DEDUP_BATCH));
+                    self.next = 0;
+                    if !self.pending.is_empty() {
+                        View::Merged(earlier).contains_batch_into(&self.pending, &mut self.held, &mut self.scratch);
+                        continue;
                     }
                 }
                 self.current = None;
             }
             let part = self.parts.get(self.index)?;
             self.index += 1;
+            self.singles = 0;
             self.current = Some(part.scan(self.bounds));
         }
     }
@@ -258,6 +326,20 @@ mod tests {
     }
 
     #[test]
+    fn large_merged_scans_deduplicate_in_batches() {
+        let a = Partition::<HeapStorage>::from_triples((0..6000).filter(|i| i % 2 == 0).map(|i| (i, 0, i + 1)).collect(), 4096);
+        let b = Partition::<HeapStorage>::from_triples((0..6000).filter(|i| i % 3 == 0).map(|i| (i, 0, i + 1)).collect(), 4096);
+        let c = Partition::<HeapStorage>::from_triples((0..6000).map(|i| (i, 0, i + 1)).collect(), 4096);
+        let parts = [&a, &b, &c];
+        let mut all: Vec<Triple> = View::Merged(&parts).scan([None; 3]).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!((n, all.len()), (6000, 6000));
+        assert_eq!(View::Merged(&parts).scan([None, None, Some(7)]).collect::<Vec<_>>(), vec![(6, 0, 7)]);
+    }
+
+    #[test]
     fn merged_views_deduplicate_across_graphs() {
         let a = Partition::<HeapStorage>::from_triples(vec![(1, 0, 2), (5, 0, 6)], 4096);
         let b = Partition::<HeapStorage>::from_triples(vec![(1, 0, 2), (2, 0, 3)], 4096);
@@ -268,6 +350,13 @@ mod tests {
         assert_eq!(all, vec![(1, 0, 2), (2, 0, 3), (5, 0, 6)]);
         assert_eq!(reach(&star(0), view, 1), vec![1, 2, 3], "paths cross graphs of a merge");
         assert!(view.contains(2, 0, 3));
+        let (mut out, mut scratch) = (Vec::new(), Vec::new());
+        view.contains_batch_into(&[(2, 0, 3), (9, 0, 9), (5, 0, 6), (1, 0, 2)], &mut out, &mut scratch);
+        assert_eq!(out, vec![true, false, true, true], "a triple is in a merge if any graph holds it");
+        View::One(&b).contains_batch_into(&[(5, 0, 6), (2, 0, 3)], &mut out, &mut scratch);
+        assert_eq!(out, vec![false, true]);
+        View::<HeapStorage>::Empty.contains_batch_into(&[(5, 0, 6)], &mut out, &mut scratch);
+        assert_eq!(out, vec![false]);
         assert_eq!(View::<HeapStorage>::Empty.scan([None; 3]).count(), 0);
     }
 }

@@ -20,6 +20,7 @@ pub mod exec;
 pub mod expr;
 pub mod group;
 pub mod hash;
+pub mod idset;
 pub mod locals;
 pub mod path;
 pub mod patterns;

@@ -2,6 +2,7 @@
 
 mod common;
 use common::*;
+use s_store::GraphRef;
 
 const DATA: &str = r#"
 ex:a ex:v 1 ; ex:s "apple" ; ex:l "chat"@fr ; ex:d 1.5 ; ex:b true ; ex:t "2020-03-04T05:06:07Z"^^xsd:dateTime .
@@ -178,6 +179,60 @@ fn aggregates() {
     assert_eq!(select(&st, "SELECT (COUNT(*) AS ?n) WHERE { ?x ex:none ?v }"), rows(&[&[&int(0)]]));
     // SUM over an error yields an unbound result.
     assert_eq!(select(&st, "SELECT (SUM(?v) AS ?s) WHERE { ?x ex:v ?v }"), rows(&[&["-"]]));
+}
+
+/// Single-pattern COUNTs are answered by s-graph's counting traversal (or
+/// the graph's size); these pin the results for every shape it takes.
+#[test]
+fn counts_of_single_patterns() {
+    let mut st = store_with(
+        r#"
+ex:a ex:p ex:b, ex:c ; ex:q "x", ex:a .
+ex:b ex:p ex:b ; ex:q "y" .
+ex:c ex:r ex:a .
+"#,
+    );
+    let count = |st: &s_store::Store, q: &str| select(st, q);
+    assert_eq!(count(&st, "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }"), rows(&[&[&int(7)]]));
+    assert_eq!(count(&st, "SELECT (COUNT(*) AS ?n) WHERE { ?s ex:p ?o }"), rows(&[&[&int(3)]]));
+    assert_eq!(count(&st, "SELECT (COUNT(?o) AS ?n) (COUNT(DISTINCT *) AS ?d) WHERE { ex:a ?p ?o }"), rows(&[&[&int(4), &int(4)]]));
+    assert_eq!(count(&st, "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p \"x\" }"), rows(&[&[&int(1)]]));
+    assert_eq!(count(&st, "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p \"absent\" }"), rows(&[&[&int(0)]]));
+    assert_eq!(count(&st, "SELECT (COUNT(*) AS ?n) WHERE { ?s ex:absent ?o }"), rows(&[&[&int(0)]]));
+    assert_eq!(count(&st, "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?s }"), rows(&[&[&int(2)]]), "a repeated variable");
+    assert_eq!(
+        count(&st, "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p"),
+        rows(&[&["<http://ex/p>", &int(3)], &["<http://ex/q>", &int(3)], &["<http://ex/r>", &int(1)]])
+    );
+    assert_eq!(
+        count(&st, "SELECT ?p (COUNT(*) AS ?n) WHERE { ex:a ?p ?o } GROUP BY ?p HAVING (COUNT(*) > 0)"),
+        rows(&[&["<http://ex/p>", &int(2)], &["<http://ex/q>", &int(2)]])
+    );
+    assert_eq!(count(&st, "SELECT ?p (COUNT(*) AS ?n) WHERE { ex:zzz ?p ?o } GROUP BY ?p"), rows(&[]), "no groups");
+    // Re-evaluated with an outer binding substituted.
+    assert_eq!(
+        count(&st, "SELECT ?x ?n WHERE { ?x ex:r ?y { SELECT ?x (COUNT(*) AS ?n) WHERE { ?x ?p ?o } GROUP BY ?x } }"),
+        rows(&[&["<http://ex/c>", &int(1)]])
+    );
+
+    load_ttl(&mut st, "ex:a ex:p ex:b . ex:z ex:p ex:z .", GraphRef::Named("<http://ex/g1>"));
+    load_ttl(&mut st, "ex:a ex:p ex:b . ex:y ex:q ex:y .", GraphRef::Named("<http://ex/g2>"));
+    assert_eq!(
+        count(&st, "SELECT ?g (COUNT(*) AS ?n) WHERE { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g"),
+        rows(&[&["<http://ex/g1>", &int(2)], &["<http://ex/g2>", &int(2)]])
+    );
+    assert_eq!(
+        count(&st, "SELECT (COUNT(*) AS ?n) FROM ex:g1 FROM ex:g2 WHERE { ?s ?p ?o }"),
+        rows(&[&[&int(3)]]),
+        "a merged default graph counts a shared triple once"
+    );
+    assert_eq!(count(&st, "SELECT ?p (COUNT(*) AS ?n) FROM ex:g1 FROM ex:g2 WHERE { ?s ?p ?o } GROUP BY ?p"), rows(&[&["<http://ex/p>", &int(2)], &["<http://ex/q>", &int(1)]]));
+    assert_eq!(
+        count(&st, "SELECT ?p (COUNT(*) AS ?n) WHERE { GRAPH ex:g2 { ?s ?p ?o } } GROUP BY ?p"),
+        rows(&[&["<http://ex/p>", &int(1)], &["<http://ex/q>", &int(1)]]),
+        "predicates of other graphs form no group"
+    );
+    assert_eq!(count(&s_store::Store::new(), "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }"), rows(&[&[&int(0)]]));
 }
 
 #[test]

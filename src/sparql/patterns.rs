@@ -18,11 +18,32 @@ use super::path::View;
 use super::plan::*;
 use crate::dict::LOCAL_ID_BASE;
 use crate::graph::Partition;
-use s_graph::BlockStorage;
+use s_graph::{BlockStorage, Triple};
 use s_graph::graph::{JoinQuery, Term as JTerm, TriplePattern as JTriple};
 use s_graph::native_join::NativeJoin;
 use s_graph::traversal::HopRange;
 use std::ops::ControlFlow;
+
+/// How many solutions a [`Node::Check`] buffers before probing them all in
+/// one batch: large enough for s-graph to share most of the descents,
+/// small enough to keep the buffer (`CHECK_BATCH` rows) in cache-sized
+/// memory and to bound the extra work done past a LIMIT.
+const CHECK_BATCH: usize = 4096;
+
+/// A probe that matches nothing: `u32::MAX` is never a stored id.
+const MISS: Triple = (u32::MAX, u32::MAX, u32::MAX);
+
+/// Reusable buffers of a [`Node::Check`] (pooled in `Env`): the buffered
+/// solutions (row-major), their probes, and s-graph's answers.
+#[derive(Default)]
+pub struct CheckBuffers {
+    len: usize,
+    rows: Vec<u32>,
+    probes: Vec<Triple>,
+    hits: Vec<bool>,
+    scratch: Vec<bool>,
+    current: Vec<u32>,
+}
 
 /// A pattern position after substituting the current row.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +89,12 @@ impl<S: BlockStorage> Ctx<'_, S> {
             }
         }
         Some((bounds, pos))
+    }
+
+    /// `t`'s bounds in tree coordinates with `row` substituted (`None`
+    /// for a free position); `None` when a bound term cannot occur.
+    pub(super) fn pattern_bounds(&self, t: &PTriple, row: &[u32]) -> Option<[Option<u32>; 3]> {
+        self.bounds(t, row).map(|(bounds, _)| bounds)
     }
 
     pub(super) fn bgp(&self, env: &mut Env, triples: &[PTriple], active: Active, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
@@ -171,6 +198,89 @@ impl<S: BlockStorage> Ctx<'_, S> {
         });
         Self::return_join_workspace(env, ws);
         flow
+    }
+
+    /// [`Node::Check`]: buffers `input`'s solutions, probes every pattern of
+    /// each with the solution substituted in one s-graph batch, and passes
+    /// on, in their original order, those whose patterns are all present
+    /// (or, `negated`, not all present).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn check(&self, env: &mut Env, input: NodeId, triples: &[PTriple], negated: bool, active: Active, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
+        let view = self.view(active);
+        let mut buffers = Self::check_buffers(env);
+        buffers.rows.clear();
+        buffers.len = 0;
+        let mut flow = self.eval(env, input, active, row, &mut |env, row| {
+            buffers.rows.extend_from_slice(row);
+            buffers.len += 1;
+            if buffers.len == CHECK_BATCH { self.flush_checks(env, &mut buffers, view, triples, negated, row, k) } else { CONTINUE }
+        });
+        if flow.is_continue() && buffers.len > 0 {
+            flow = self.flush_checks(env, &mut buffers, view, triples, negated, row, k);
+        }
+        Self::return_check_buffers(env, buffers);
+        flow
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn flush_checks(&self, env: &mut Env, b: &mut CheckBuffers, view: View<'_, S>, triples: &[PTriple], negated: bool, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
+        let width = row.len();
+        let n = b.len;
+        b.probes.clear();
+        for i in 0..n {
+            let solution = &b.rows[i * width..(i + 1) * width];
+            b.probes.extend(triples.iter().map(|t| self.probe(t, solution)));
+        }
+        view.contains_batch_into(&b.probes, &mut b.hits, &mut b.scratch);
+        b.current.clear();
+        b.current.extend_from_slice(row);
+        let mut flow = CONTINUE;
+        let m = triples.len();
+        for i in 0..n {
+            if b.hits[i * m..(i + 1) * m].iter().all(|&hit| hit) == negated {
+                continue;
+            }
+            row.copy_from_slice(&b.rows[i * width..(i + 1) * width]);
+            flow = k(env, row);
+            if flow.is_break() {
+                break;
+            }
+        }
+        row.copy_from_slice(&b.current);
+        b.rows.clear();
+        b.len = 0;
+        flow
+    }
+
+    /// [`Node::SetJoin`]: one native join of both BGPs (`joined`) records
+    /// which `slot` values have a match (passing the joined solutions on
+    /// for an OPTIONAL), then one pass over `left` keeps, drops or adds its
+    /// solutions by membership. Two s-graph traversals and one bit per
+    /// dictionary id, instead of a lookup or a probe per left solution.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn set_join(&self, env: &mut Env, left: NodeId, joined: &[PTriple], slot: Slot, kind: SetJoinKind, active: Active, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
+        let s = slot as usize;
+        let mut matched = self.id_set(env);
+        let mut flow = self.bgp(env, joined, active, row, &mut |env, row| {
+            matched.insert(row[s]);
+            if kind == SetJoinKind::LeftOuter { k(env, row) } else { CONTINUE }
+        });
+        if flow.is_continue() {
+            matched.freeze();
+            let keep = kind == SetJoinKind::Semi;
+            flow = self.eval(env, left, active, row, &mut |env, row| if matched.contains(row[s]) == keep { k(env, row) } else { CONTINUE });
+        }
+        Self::return_id_set(env, matched);
+        flow
+    }
+
+    /// `t` with `solution` substituted, in tree coordinates; [`MISS`] when a
+    /// term cannot occur in the data.
+    fn probe(&self, t: &PTriple, solution: &[u32]) -> Triple {
+        match self.bounds(t, solution) {
+            Some(([Some(s), Some(p), Some(o)], _)) => (s, p, o),
+            _ => MISS,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

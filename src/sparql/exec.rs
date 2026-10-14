@@ -9,11 +9,14 @@
 //!
 //! Intermediate results exist only where the algebra needs them:
 //! [`JoinMode::Materialize`] right sides (once per active graph, cached),
-//! MINUS right sides, and the blocking operators (ORDER BY, GROUP BY,
-//! DISTINCT's seen-set).
+//! MINUS right sides, [`Node::SetJoin`]'s id sets, the blocking operators (ORDER BY, GROUP BY,
+//! DISTINCT's seen-set), and bounded batches of rows awaiting a
+//! [`Node::Check`].
 
 use super::locals::LocalTerms;
 use super::path::View;
+use super::idset::IdSet;
+use super::patterns::CheckBuffers;
 use super::plan::*;
 use super::value::Arena;
 use crate::graph::{GraphName, Partition};
@@ -105,6 +108,8 @@ pub struct Env {
     pub scratch: String,
     pub saved: Vec<u32>,
     join_workspaces: Vec<NativeJoinWorkspace>,
+    check_buffers: Vec<CheckBuffers>,
+    id_sets: Vec<IdSet>,
     automaton_workspaces: Vec<AutomatonWorkspace>,
     automata: HashMap<PathId, Rc<[PathAutomaton; 2]>>,
     materialized: HashMap<(NodeId, u64), Rc<Materialized>>,
@@ -125,6 +130,8 @@ impl Env {
             scratch: String::new(),
             saved: Vec::new(),
             join_workspaces: Vec::new(),
+            check_buffers: Vec::new(),
+            id_sets: Vec::new(),
             automaton_workspaces: Vec::new(),
             automata: HashMap::new(),
             materialized: HashMap::new(),
@@ -275,6 +282,8 @@ impl<'q, S: BlockStorage> Ctx<'q, S> {
                     CONTINUE
                 }
             },
+            Node::SetJoin { left, joined, slot, kind } => self.set_join(env, left, self.plan.triples(joined), slot, kind, active, row, k),
+            Node::Check { input, triples, negated } => self.check(env, input, self.plan.triples(triples), negated, active, row, k),
             Node::Filter(e, a) => self.eval(env, a, active, row, &mut |env, row| if self.ebv(env, e, row, active) { k(env, row) } else { CONTINUE }),
             Node::Extend(a, slot, e) => self.eval(env, a, active, row, &mut |env, row| {
                 let s = slot as usize;
@@ -394,6 +403,28 @@ impl<'q, S: BlockStorage> Ctx<'q, S> {
 
     pub(super) fn return_join_workspace(env: &mut Env, ws: NativeJoinWorkspace) {
         env.join_workspaces.push(ws);
+    }
+
+    pub(super) fn check_buffers(env: &mut Env) -> CheckBuffers {
+        env.check_buffers.pop().unwrap_or_default()
+    }
+
+    pub(super) fn return_check_buffers(env: &mut Env, buffers: CheckBuffers) {
+        env.check_buffers.push(buffers);
+    }
+
+    /// An empty id set over the dictionary's ids, from the query's pool.
+    pub(super) fn id_set(&self, env: &mut Env) -> IdSet {
+        let bound = self.store.dictionary().id_bound();
+        match env.id_sets.pop() {
+            Some(set) if set.covers(bound) => set,
+            _ => IdSet::new(bound),
+        }
+    }
+
+    pub(super) fn return_id_set(env: &mut Env, mut set: IdSet) {
+        set.clear();
+        env.id_sets.push(set);
     }
 
     pub(super) fn automaton_workspace(env: &mut Env) -> AutomatonWorkspace {

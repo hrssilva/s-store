@@ -166,6 +166,22 @@ impl<S: BlockStorage> QuadIndex<S> {
         self.partition(graph).is_some_and(|part| part.contains(s.0, p, o.0))
     }
 
+    /// [`Self::contains`] for each `(s, p, o)` of `quads` in `graph`, into
+    /// `out` in input order; `probes` is scratch for the tree coordinates
+    /// (reused across calls). One batched s-graph descent for all of them.
+    pub fn contains_batch_into(&self, graph: GraphName, quads: &[(TermId, TermId, TermId)], probes: &mut Vec<Triple>, out: &mut Vec<bool>) {
+        let Some(part) = self.partition(graph) else {
+            out.clear();
+            out.resize(quads.len(), false);
+            return;
+        };
+        probes.clear();
+        // An unknown predicate becomes `u32::MAX`, never a dense id, so the
+        // probe misses.
+        probes.extend(quads.iter().map(|&(s, p, o)| (s.0, self.predicates.get(p).unwrap_or(u32::MAX), o.0)));
+        part.contains_batch_into(probes, out);
+    }
+
     /// Drops every quad of `graph`.
     pub fn clear_graph(&mut self, graph: GraphName) {
         match graph {
@@ -339,6 +355,19 @@ mod tests {
         assert!(q.contains(GraphName::Default, TermId(7), TermId(902), TermId(8)));
         assert_eq!(q.extend(G2, vec![]), 0);
         assert!(q.partition(G2).is_none());
+    }
+
+    #[test]
+    fn batched_contains_maps_predicates_and_misses_unknown_ones() {
+        let q = sample();
+        let quads = [t(3, 51, 4), t(1, 50, 2), t(3, 99, 4), t(5, 50, 6), t(1, 51, 2)];
+        let (mut probes, mut out) = (Vec::new(), Vec::new());
+        q.contains_batch_into(G1, &quads, &mut probes, &mut out);
+        assert_eq!(out, vec![true, true, false, false, false]);
+        q.contains_batch_into(GraphName::Default, &quads, &mut probes, &mut out);
+        assert_eq!(out, vec![false, true, false, false, false]);
+        q.contains_batch_into(GraphName::Named(TermId(7)), &quads, &mut probes, &mut out);
+        assert_eq!(out, vec![false; 5], "a missing graph holds nothing");
     }
 
     #[test]

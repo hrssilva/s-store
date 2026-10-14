@@ -95,6 +95,16 @@ impl Dictionary {
         self.inner.is_empty()
     }
 
+    /// Reassigns every id to its term's rank in term order, and returns the
+    /// mapping by old id (`u32::MAX` for ids not in use). Every id held
+    /// elsewhere is invalidated: only for callers that remap all of them.
+    pub fn renumber_term_order(&mut self) -> Vec<u32> {
+        let order: Vec<usize> = (0..self.inner.block_count()).collect();
+        let map = self.inner.renumber(&order);
+        self.id_bound = self.inner.len() as u32;
+        map
+    }
+
     /// End of a load: compacts the dictionary (see s-dict's `shrink_to_fit`).
     pub fn shrink_to_fit(&mut self) {
         self.inner.shrink_to_fit();

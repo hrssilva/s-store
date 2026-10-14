@@ -706,6 +706,10 @@ impl VarSet {
         self.0.iter().all(|&w| w == 0)
     }
 
+    fn contains(&self, s: Slot) -> bool {
+        self.0.get(s as usize / 64).is_some_and(|w| w & (1 << (s % 64)) != 0)
+    }
+
     fn slots(&self) -> impl Iterator<Item = Slot> + '_ {
         self.0.iter().enumerate().flat_map(|(i, &w)| (0..64).filter(move |b| w & (1 << b) != 0).map(move |b| (i * 64 + b) as Slot))
     }
@@ -822,6 +826,19 @@ impl Analysis {
                 let a = a as usize;
                 (self.maybe[a].clone(), self.certain[a].clone(), self.refs[a].union(&self.vars_of_expr(plan, e)))
             }
+            Node::Check { input, .. } => {
+                let a = input as usize;
+                (self.maybe[a].clone(), self.certain[a].clone(), self.refs[a].clone())
+            }
+            Node::SetJoin { left, joined, kind, .. } => {
+                let mut v = VarSet::default();
+                for t in plan.triples(joined) {
+                    term_vars(&[t.s, t.p, t.o], &mut v);
+                }
+                let a = left as usize;
+                let maybe = if kind == SetJoinKind::LeftOuter { v.clone() } else { self.maybe[a].clone() };
+                (maybe, self.certain[a].clone(), v)
+            }
             Node::Extend(a, v, e) => {
                 let a = a as usize;
                 let mut maybe = self.maybe[a].clone();
@@ -875,7 +892,7 @@ impl Analysis {
         let i = id as usize;
         match plan.node(id) {
             Node::Unit | Node::Empty | Node::Bgp(_) | Node::Path { .. } | Node::Table { .. } => true,
-            Node::Join(a, ..) | Node::Minus(a, _) | Node::Graph(_, a) => self.transparent(plan, a, input),
+            Node::Join(a, ..) | Node::Minus(a, _) | Node::Graph(_, a) | Node::Check { input: a, .. } | Node::SetJoin { left: a, .. } => self.transparent(plan, a, input),
             Node::Union(a, b) => self.transparent(plan, a, input) && self.transparent(plan, b, input),
             Node::LeftJoin(a, b, cond, _) => {
                 let mut right = self.refs[b as usize].clone();
@@ -893,14 +910,56 @@ impl Analysis {
         self.certain[a as usize].intersect(&self.certain[b as usize]).slots().next()
     }
 
+    /// Rewrites `id` into a [`Node::Check`] over `left` when `right` is a
+    /// BGP whose every variable `left` certainly binds (and, for MINUS,
+    /// shares at least one with it): substituting a left solution leaves
+    /// only point lookups, which s-graph answers in batches.
+    fn check(&self, plan: &mut Plan, id: NodeId, left: NodeId, right: NodeId, negated: bool, minus: bool) -> bool {
+        let Node::Bgp(triples) = plan.node(right) else { return false };
+        let vars = &self.refs[right as usize];
+        if triples.len == 0 || !vars.is_subset(&self.certain[left as usize]) || (minus && vars.is_empty()) {
+            return false;
+        }
+        plan.nodes[id as usize] = Node::Check { input: left, triples, negated };
+        true
+    }
+
+    /// Rewrites `id` into a [`Node::SetJoin`] when `left` and `right` are
+    /// BGPs whose only shared variable — among the right side's and
+    /// everything visible to it (`input`, the left side's) — is one both
+    /// certainly bind: a left solution's match then depends on that value
+    /// alone, so one native join of both BGPs decides all of them.
+    fn set_join(&self, plan: &mut Plan, id: NodeId, left: NodeId, right: NodeId, input: &VarSet, kind: SetJoinKind) -> bool {
+        let (Node::Bgp(l), Node::Bgp(r)) = (plan.node(left), plan.node(right)) else { return false };
+        let shared = self.refs[right as usize].intersect(&input.union(&self.maybe[left as usize]));
+        let mut slots = shared.slots();
+        let (Some(slot), None) = (slots.next(), slots.next()) else { return false };
+        if !self.certain[left as usize].contains(slot) || !self.certain[right as usize].contains(slot) {
+            return false;
+        }
+        let start = plan.triples.len() as u32;
+        plan.triples.extend_from_within(l.indices());
+        plan.triples.extend_from_within(r.indices());
+        plan.nodes[id as usize] = Node::SetJoin { left, joined: Range { start, len: l.len + r.len }, slot, kind };
+        true
+    }
+
     /// Chooses join modes top-down; `input` are the slots that may be bound
-    /// when `id` is evaluated.
+    /// when `id` is evaluated. Existence tests and joins against patterns
+    /// the left side binds fully become batched [`Node::Check`]s; those
+    /// sharing one variable with a left BGP become [`Node::SetJoin`]s.
     fn annotate(&self, plan: &mut Plan, id: NodeId, input: &VarSet) {
         let node = plan.node(id);
         let exists_in = |s: &Self, plan: &mut Plan, e: ExprId, scope: &VarSet| s.annotate_expr(plan, e, scope);
         match node {
             Node::Join(a, b, _) | Node::LeftJoin(a, b, _, _) => {
                 self.annotate(plan, a, input);
+                if matches!(node, Node::Join(..)) && self.check(plan, id, a, b, false, false) {
+                    return;
+                }
+                if matches!(node, Node::LeftJoin(_, _, None, _)) && self.set_join(plan, id, a, b, input, SetJoinKind::LeftOuter) {
+                    return;
+                }
                 let left = input.union(&self.maybe[a as usize]);
                 let bind = self.transparent(plan, b, &left);
                 let mode = if bind { JoinMode::Bind } else { JoinMode::Materialize { key: self.key_slot(a, b) } };
@@ -924,11 +983,20 @@ impl Analysis {
             }
             Node::Minus(a, b) => {
                 self.annotate(plan, a, input);
-                self.annotate(plan, b, &VarSet::default());
+                if !self.check(plan, id, a, b, true, true) && !self.set_join(plan, id, a, b, input, SetJoinKind::Anti) {
+                    self.annotate(plan, b, &VarSet::default());
+                }
             }
-            Node::Graph(_, a) | Node::Slice { input: a, .. } | Node::Distinct { input: a, .. } | Node::Project { input: a, .. } => self.annotate(plan, a, input),
+            Node::Graph(_, a) | Node::Check { input: a, .. } | Node::SetJoin { left: a, .. } | Node::Slice { input: a, .. } | Node::Distinct { input: a, .. } | Node::Project { input: a, .. } => self.annotate(plan, a, input),
             Node::Filter(e, a) | Node::Extend(a, _, e) => {
                 self.annotate(plan, a, input);
+                if let (Node::Filter(..), Expr::Exists(b) | Expr::NotExists(b)) = (node, plan.expr(e)) {
+                    let negated = matches!(plan.expr(e), Expr::NotExists(_));
+                    let kind = if negated { SetJoinKind::Anti } else { SetJoinKind::Semi };
+                    if self.check(plan, id, a, b, negated, false) || self.set_join(plan, id, a, b, input, kind) {
+                        return;
+                    }
+                }
                 let scope = input.union(&self.maybe[a as usize]);
                 exists_in(self, plan, e, &scope);
             }
@@ -1018,7 +1086,7 @@ mod tests {
     #[test]
     fn optional_without_outer_filters_binds() {
         let st = store();
-        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o OPTIONAL { ?o <http://p> ?z } }");
+        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o OPTIONAL { ?o <http://p> ?z . ?z <http://p> ?s } }");
         assert_eq!(join_modes(&plan), vec![JoinMode::Bind]);
     }
 
@@ -1037,6 +1105,82 @@ mod tests {
         let plan = plan_for(&st, "SELECT * WHERE { ?a <http://p> ?b OPTIONAL { ?b <http://p> ?c OPTIONAL { ?c <http://p> ?a } } }");
         let modes = join_modes(&plan);
         assert!(modes.contains(&JoinMode::Materialize { key: Some(1) }) || modes.iter().any(|m| matches!(m, JoinMode::Materialize { .. })), "{modes:?}");
+    }
+
+    /// The `Check` nodes of a plan: (number of patterns, negated).
+    fn checks(plan: &Plan) -> Vec<(u32, bool)> {
+        plan.nodes.iter().filter_map(|n| match n {
+            Node::Check { triples, negated, .. } => Some((triples.len, *negated)),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn fully_bound_existence_patterns_become_batched_checks() {
+        let st = store();
+        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o FILTER EXISTS { ?o <http://p> ?s } }");
+        assert_eq!(checks(&plan), vec![(1, false)]);
+        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o FILTER NOT EXISTS { ?o <http://p> <http://b> . ?s <http://p> ?o } }");
+        assert_eq!(checks(&plan), vec![(2, true)]);
+        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o MINUS { ?o <http://p> ?s } }");
+        assert_eq!(checks(&plan), vec![(1, true)]);
+        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o OPTIONAL { ?o <http://p> ?z } ?s <http://p> <http://b> }");
+        assert_eq!(checks(&plan), vec![(1, false)], "a join whose right side the left binds fully");
+    }
+
+    #[test]
+    fn existence_patterns_with_free_or_maybe_bound_variables_stay_as_they_are() {
+        let st = store();
+        for q in [
+            "SELECT * WHERE { ?s <http://p> ?o FILTER NOT EXISTS { ?o <http://p> ?z } }",
+            "SELECT * WHERE { ?s <http://p> ?o OPTIONAL { ?o <http://p> ?z } FILTER EXISTS { ?z <http://p> ?s } }",
+            "SELECT * WHERE { ?s <http://p> ?o MINUS { <http://a> <http://p> <http://b> } }",
+            "SELECT * WHERE { ?s <http://p> ?o FILTER (EXISTS { ?o <http://p> ?s } || ?s = ?o) }",
+        ] {
+            assert_eq!(checks(&plan_for(&st, q)), vec![], "{q}");
+        }
+    }
+
+    /// The `SetJoin` nodes of a plan: (joined pattern count, kind).
+    fn set_joins(plan: &Plan) -> Vec<(u32, SetJoinKind)> {
+        plan.nodes.iter().filter_map(|n| match n {
+            Node::SetJoin { joined, kind, .. } => Some((joined.len, *kind)),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn single_variable_optionals_and_negations_become_set_joins() {
+        let st = store();
+        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o OPTIONAL { ?s <http://q> ?v } }");
+        assert_eq!(set_joins(&plan), vec![(2, SetJoinKind::LeftOuter)]);
+        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o FILTER NOT EXISTS { ?s <http://q> ?v . ?v <http://q> ?w } }");
+        assert_eq!(set_joins(&plan), vec![(3, SetJoinKind::Anti)]);
+        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o FILTER EXISTS { ?s <http://q> ?v } }");
+        assert_eq!(set_joins(&plan), vec![(2, SetJoinKind::Semi)]);
+        let plan = plan_for(&st, "SELECT * WHERE { ?s <http://p> ?o MINUS { ?s <http://q> ?v } }");
+        assert_eq!(set_joins(&plan), vec![(2, SetJoinKind::Anti)]);
+    }
+
+    #[test]
+    fn set_joins_need_one_shared_variable_between_two_bgps() {
+        let st = store();
+        for q in [
+            // A join condition.
+            "SELECT * WHERE { ?s <http://p> ?o OPTIONAL { ?s <http://q> ?v FILTER(?v != ?o) } }",
+            // Two shared variables.
+            "SELECT * WHERE { ?s <http://p> ?o OPTIONAL { ?s <http://q> ?o2 . ?o <http://q> ?z } }",
+            // No shared variable.
+            "SELECT * WHERE { ?s <http://p> ?o MINUS { ?x <http://q> ?v } }",
+            // The right side is not a BGP.
+            "SELECT * WHERE { ?s <http://p> ?o OPTIONAL { { ?s <http://q> ?v } UNION { ?s <http://p> ?v } } }",
+            // The left side is not a BGP.
+            "SELECT * WHERE { { ?s <http://p> ?o } UNION { ?s <http://q> ?o } MINUS { ?s <http://q> ?v } }",
+            // A fully bound right side is a batched check instead.
+            "SELECT * WHERE { ?s <http://p> ?o FILTER NOT EXISTS { ?o <http://p> ?s } }",
+        ] {
+            assert_eq!(set_joins(&plan_for(&st, q)), vec![], "{q}");
+        }
     }
 
     #[test]
