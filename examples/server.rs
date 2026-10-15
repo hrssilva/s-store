@@ -1,11 +1,13 @@
 //! A minimal SPARQL endpoint over HTTP, standard library only.
 //!
 //! ```text
-//! cargo run --release --example server -- [--bind 127.0.0.1:7878] [FILE[=GRAPH]]...
+//! cargo run --release --features parallel --example server -- [--bind 127.0.0.1:7878] [--workers N] [FILE[=GRAPH]]...
 //! ```
 //!
 //! Every `FILE` (`.nt` or `.ttl`) is loaded before serving, into the default
-//! graph or, with `=GRAPH`, into that named graph. Then:
+//! graph or, with `=GRAPH`, into that named graph. N-Triples files are parsed
+//! by `--workers` threads (default: the available cores); Turtle by one.
+//! Then:
 //!
 //! - `GET /`: a page for running queries and uploading data.
 //! - `GET /sparql?query=...` or `POST /sparql` (body `application/sparql-query`,
@@ -20,7 +22,7 @@
 //! authentication: it binds to localhost unless told otherwise.
 
 use s_parser::FileStream;
-use s_store::load::{Format, LoadOptions, load, load_slice};
+use s_store::load::{Format, LoadOptions, load, load_parallel, load_slice};
 use s_store::sparql::QueryOutput;
 use s_store::{GraphRef, Store};
 use std::io::{BufRead, BufReader, Write};
@@ -33,13 +35,15 @@ const MAX_BODY: usize = 1 << 30;
 
 fn main() {
     let mut bind = "127.0.0.1:7878".to_string();
+    let mut workers = std::thread::available_parallelism().map_or(1, usize::from);
     let mut files = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => bind = args.next().expect("--bind takes an address"),
+            "--workers" => workers = args.next().and_then(|n| n.parse().ok()).expect("--workers takes a number"),
             "-h" | "--help" => {
-                eprintln!("usage: server [--bind ADDR] [FILE[=GRAPH]]...");
+                eprintln!("usage: server [--bind ADDR] [--workers N] [FILE[=GRAPH]]...");
                 return;
             }
             _ => files.push(arg),
@@ -57,7 +61,12 @@ fn main() {
         let t = Instant::now();
         // Memory-mapped windows: the file is never read into memory whole.
         let stream = unsafe { FileStream::open(path, 4 << 20) }.unwrap_or_else(|e| panic!("{path}: {e}"));
-        let stats = load(&mut store, stream, format, &LoadOptions { graph, ..Default::default() }).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let options = LoadOptions { graph, ..Default::default() };
+        let stats = match format {
+            Format::NTriples => load_parallel(&mut store, || stream.clone(), &options, workers),
+            Format::Turtle => load(&mut store, stream, format, &options),
+        }
+        .unwrap_or_else(|e| panic!("{path}: {e}"));
         eprintln!("loaded {path}: {} triples ({} new) in {:.2?}", stats.triples, stats.inserted, t.elapsed());
     }
     store.shrink_to_fit();

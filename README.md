@@ -35,13 +35,17 @@ the known gaps.
 `examples/server.rs` serves a store over HTTP (standard library only):
 
 ```sh
-cargo run --release --example server -- [--bind 127.0.0.1:7878] [FILE[=GRAPH]]...
+cargo run --release --features parallel --example server -- [--bind 127.0.0.1:7878] [--workers N] [FILE[=GRAPH]]...
 # e.g. data.nt into the default graph, more.ttl into a named graph:
-cargo run --release --example server -- data.nt more.ttl=http://ex/g1
+cargo run --release --features parallel --example server -- data.nt more.ttl=http://ex/g1
 ```
 
 Files (`.nt`, `.ttl`) are loaded before serving, read through memory-mapped
-windows. Then open `http://127.0.0.1:7878/` for a page that runs queries and
+windows. N-Triples files are parsed by `--workers` threads (default: the
+available cores), and into an empty store also interned by as many
+dictionary writer threads; Turtle files load on one thread. `--features
+parallel` (optional, it pulls in rayon) builds the graph trees in parallel
+too. Then open `http://127.0.0.1:7878/` for a page that runs queries and
 uploads files, or use the endpoints directly:
 
 | Endpoint | |

@@ -22,17 +22,26 @@
 //! Blank node labels are scoped to the load ([`BlankScope`]).
 //!
 //! [`load_parallel`] splits N-Triples input into byte ranges parsed by
-//! worker threads, which also prepare (sort and group) their batches; the
-//! calling thread interns them, taking one batch from each worker in turn so
-//! the ids are the same on every run.
+//! worker threads, which also prepare (sort and group) their batches.
+//! Into a store with an empty dictionary, the dictionary is sharded by key
+//! range ([`s_dict::ShardedDictionary`]): workers route each term to its
+//! shard, writer threads each intern into their own shards, and workers
+//! combine the returned ids into triples; at the end the shards are joined
+//! into one dictionary already in term order
+//! (`PackedAutomatonDictionary::concat_in_term_order`), so the ids are the
+//! same as a sequential load's. Into a non-empty store, the calling thread
+//! interns the workers' batches, taking one from each worker in turn so the
+//! ids are the same on every run.
 
+use crate::dict::{Dictionary, LOCAL_ID_BASE};
 use crate::error::{Result, StoreError};
 use crate::graph::GraphName;
 use crate::store::{GraphRef, Store};
 use crate::term::{BlankScope, KeyBuf, nt_fast_key};
-use s_dict::{PreparedBatch, TermBatch, TermId};
+use s_dict::{DictError, PackedAutomatonDictionary, PreparedBatch, ShardRouter, ShardedDictionary, TermBatch, TermDictionary, TermId};
 use s_graph::{BlockStorage, Triple};
 use s_parser::{NtTokenizer, QuadReader, SeekableStream, SliceStream, Stream, TurtleReader, TurtleTokenizer};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,14 +146,18 @@ pub fn load<S: BlockStorage, St: Stream>(store: &mut Store<S>, stream: St, forma
 /// thread interns their batches and builds the graph. The store ends up
 /// with the same quads as with [`load`].
 ///
-/// Batches are interned in arrival order, not file order; like [`load`],
-/// a load into a store whose dictionary was empty ends with term-order
-/// ids, here independent of `workers`. Otherwise ids are the same on every
-/// run with the same `workers` and `batch_triples`. `workers <= 1` is
-/// [`load`].
+/// Into a store whose dictionary is empty, the dictionary is sharded and
+/// interned by writer threads too (see the module docs); like [`load`],
+/// the load ends with term-order ids, here independent of `workers`.
+/// Otherwise batches are interned in arrival order, not file order, and ids
+/// are the same on every run with the same `workers` and `batch_triples`.
+/// `workers <= 1` is [`load`].
 pub fn load_parallel<S: BlockStorage, St: SeekableStream + Send>(store: &mut Store<S>, open: impl Fn() -> St + Sync, options: &LoadOptions<'_>, workers: usize) -> Result<LoadStats> {
     if workers <= 1 {
         return load(store, open(), Format::NTriples, options);
+    }
+    if store.dictionary().is_empty() {
+        return load_sharded(store, open, options, workers);
     }
     let mut batcher = Batcher::new(store, options)?;
     let (scope, batch_triples, len) = (batcher.scope, batcher.batch_triples, open().len());
@@ -232,6 +245,215 @@ pub fn load_parallel<S: BlockStorage, St: SeekableStream + Send>(store: &mut Sto
         result
     })?;
     batcher.finish()
+}
+
+/// Key-range shards per writer thread, dealt round-robin: fine shards
+/// spread dense key regions over every writer (s-bench's
+/// `nt_dict_file_bench`, DESIGN.md's "sharding the writer" in s-dict).
+const SHARDS_PER_WRITER: usize = 32;
+/// Shard bounds come from this many evenly spaced byte ranges, reading up
+/// to this many triples from each.
+const SAMPLE_RANGES: u64 = 64;
+const SAMPLE_TRIPLES_PER_RANGE: usize = 1024;
+
+/// A parsed term's canonical key: borrowed from the record when it already
+/// is one, else encoded into `key`.
+fn nt_key<'a>(term: s_parser::Term<'a>, key: &'a mut KeyBuf, scope: BlankScope) -> Result<&'a str> {
+    match nt_fast_key(term) {
+        Some(k) => Ok(k),
+        None => Ok(key.resolved(term.resolve(), scope, None)?),
+    }
+}
+
+/// Shard bounds splitting the keys of a sample spread over the input into
+/// `shards` similar counts (`ShardedDictionary::bounds_from_sample`).
+fn sample_bounds<St: SeekableStream>(open: &impl Fn() -> St, len: u64, scope: BlankScope, shards: usize) -> Result<Vec<String>> {
+    let mut key = KeyBuf::new();
+    let (mut text, mut ends) = (String::new(), Vec::new());
+    for i in 0..SAMPLE_RANGES {
+        let range = len * i / SAMPLE_RANGES..len * (i + 1) / SAMPLE_RANGES;
+        let mut reader = QuadReader::for_range(open(), NtTokenizer, range)?;
+        for _ in 0..SAMPLE_TRIPLES_PER_RANGE {
+            let Some(quad) = reader.next()? else { break };
+            for term in [quad.subject(), quad.predicate(), quad.object()] {
+                text.push_str(nt_key(term, &mut key, scope)?);
+                ends.push(text.len());
+            }
+        }
+    }
+    let mut sample: Vec<&str> = ends.iter().scan(0, |start, &end| Some(&text[std::mem::replace(start, end)..end])).collect();
+    Ok(ShardedDictionary::<PackedAutomatonDictionary>::bounds_from_sample(&mut sample, shards))
+}
+
+/// What a writer thread answers a worker: the shard, its ids for the
+/// sub-batch (input order), and the batch back for reuse.
+type Reply = (usize, Result<Vec<TermId>>, PreparedBatch);
+
+/// [`load_parallel`] into a store with an empty dictionary. `workers`
+/// parser threads each read a byte range, route every key to a key-range
+/// shard's batch and, per parsed batch, send each shard's sub-batch to the
+/// writer thread owning that shard, then wait for the ids and keep the
+/// batch's triples with shard-encoded ids (`ShardRouter::global_id`).
+/// Writers (as many as workers: a waiting worker sleeps) each intern into
+/// their own shards. At the end the shards are joined in term order, the
+/// triples remapped to the joined ids, and the graph bulk-built.
+fn load_sharded<S: BlockStorage, St: SeekableStream + Send>(store: &mut Store<S>, open: impl Fn() -> St + Sync, options: &LoadOptions<'_>, workers: usize) -> Result<LoadStats> {
+    // Validates the graph name; the store's dictionary is replaced below.
+    store.graph_name(options.graph)?;
+    let scope = store.new_blank_scope();
+    let writers = workers;
+    let len = open().len();
+    let mut dict = ShardedDictionary::new(sample_bounds(&open, len, scope, writers * SHARDS_PER_WRITER)?, PackedAutomatonDictionary::new);
+    let graph = match options.graph {
+        GraphRef::Default => None,
+        GraphRef::Named(key) => Some(dict.try_insert(key)?),
+    };
+    let router = dict.router();
+    let batch_terms = 3 * options.batch_triples.max(1);
+    let abort = AtomicBool::new(false);
+    let parts = std::thread::scope(|threads| -> Result<Vec<Vec<Triple>>> {
+        let mut owned: Vec<Vec<&mut PackedAutomatonDictionary>> = (0..writers).map(|_| Vec::new()).collect();
+        for (i, shard) in dict.shards_mut().iter_mut().enumerate() {
+            owned[i % writers].push(shard);
+        }
+        let (reply_tx, reply_rx): (Vec<_>, Vec<_>) = (0..workers).map(|_| mpsc::channel::<Reply>()).unzip();
+        let mut requests = Vec::with_capacity(writers);
+        for mut shards in owned {
+            // One parsed batch's worth of sub-batches per writer.
+            let (tx, rx) = mpsc::sync_channel::<(usize, usize, PreparedBatch)>(SHARDS_PER_WRITER);
+            requests.push(tx);
+            let replies = reply_tx.clone();
+            threads.spawn(move || {
+                while let Ok((worker, shard, batch)) = rx.recv() {
+                    let ids = shards[shard / writers].try_insert_prepared(&batch).map_err(StoreError::from);
+                    // A worker stops listening only on an error of its own.
+                    let _ = replies[worker].send((shard, ids, batch));
+                }
+            });
+        }
+        drop(reply_tx);
+        let mut handles = Vec::with_capacity(workers);
+        for (worker, replies) in reply_rx.into_iter().enumerate() {
+            let range = len * worker as u64 / workers as u64..len * (worker as u64 + 1) / workers as u64;
+            let (stream, requests, router, abort) = (open(), requests.clone(), &router, &abort);
+            handles.push(threads.spawn(move || {
+                let result = parse_sharded(stream, range, scope, router, batch_terms, worker, &requests, &replies, abort);
+                if result.is_err() {
+                    abort.store(true, Ordering::Relaxed);
+                }
+                result
+            }));
+        }
+        // Writers stop once every worker has dropped its senders.
+        drop(requests);
+        let mut parts = Vec::with_capacity(workers);
+        let mut error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(triples)) => parts.push(triples),
+                Ok(Err(e)) => {
+                    error.get_or_insert(e);
+                }
+                Err(_) => {
+                    error.get_or_insert_with(|| StoreError::Query("a parser worker panicked".into()));
+                }
+            }
+        }
+        error.map_or(Ok(parts), Err)
+    })?;
+    if dict.len() as u64 > u64::from(LOCAL_ID_BASE) {
+        return Err(DictError::IdsExhausted { needed: dict.len() as u64, available: u64::from(LOCAL_ID_BASE) }.into());
+    }
+    let (joined, maps) = PackedAutomatonDictionary::concat_in_term_order(dict.into_shards());
+    let remap = |id: u32| {
+        let (shard, local) = router.split_id(TermId(id));
+        maps[shard][local.0 as usize]
+    };
+    let mut parts = parts;
+    std::thread::scope(|threads| {
+        for part in &mut parts {
+            threads.spawn(|| {
+                for t in part.iter_mut() {
+                    *t = (remap(t.0), remap(t.1), remap(t.2));
+                }
+            });
+        }
+    });
+    let total = parts.iter().map(Vec::len).sum();
+    let triples = if parts.len() == 1 {
+        parts.pop().expect("one part")
+    } else {
+        let mut triples = Vec::with_capacity(total);
+        for part in parts {
+            triples.extend_from_slice(&part);
+        }
+        triples
+    };
+    let graph = graph.map_or(GraphName::Default, |g| GraphName::Named(TermId(remap(g.0))));
+    let id_bound = joined.len() as u32;
+    let (store_dict, index) = store.parts_mut();
+    *store_dict = Dictionary::from_parts(joined, id_bound);
+    let inserted = index.extend(graph, triples);
+    Ok(LoadStats { triples: total as u64, inserted })
+}
+
+/// One [`load_sharded`] worker: parses `range` and returns its triples,
+/// with shard-encoded ids.
+#[allow(clippy::too_many_arguments)]
+fn parse_sharded<St: SeekableStream>(
+    stream: St,
+    range: std::ops::Range<u64>,
+    scope: BlankScope,
+    router: &ShardRouter,
+    batch_terms: usize,
+    worker: usize,
+    requests: &[mpsc::SyncSender<(usize, usize, PreparedBatch)>],
+    replies: &mpsc::Receiver<Reply>,
+    abort: &AtomicBool,
+) -> Result<Vec<Triple>> {
+    let writer_gone = || StoreError::Query("a dictionary writer stopped".into());
+    let mut reader = QuadReader::for_range(stream, NtTokenizer, range)?;
+    let mut key = KeyBuf::new();
+    let mut batches: Vec<TermBatch> = (0..router.shard_count()).map(|_| TermBatch::new()).collect();
+    let mut ids: Vec<Vec<TermId>> = vec![Vec::new(); router.shard_count()];
+    // Per term of the parsed batch: (shard, position in its sub-batch).
+    let mut slots: Vec<(u32, u32)> = Vec::with_capacity(batch_terms);
+    let mut triples = Vec::new();
+    while !abort.load(Ordering::Relaxed) {
+        slots.clear();
+        while slots.len() < batch_terms {
+            let Some(quad) = reader.next()? else { break };
+            if quad.graph().is_some() {
+                return Err(StoreError::Query("N-Quads graph terms are not supported by the loader yet".into()));
+            }
+            for term in [quad.subject(), quad.predicate(), quad.object()] {
+                let k = nt_key(term, &mut key, scope)?;
+                let shard = router.shard_of(k);
+                slots.push((shard as u32, batches[shard].len() as u32));
+                batches[shard].push(k);
+            }
+        }
+        if slots.is_empty() {
+            break;
+        }
+        let mut pending = 0;
+        for (shard, batch) in batches.iter_mut().enumerate() {
+            if !batch.is_empty() {
+                requests[shard % requests.len()].send((worker, shard, std::mem::take(batch).prepare())).map_err(|_| writer_gone())?;
+                pending += 1;
+            }
+        }
+        for _ in 0..pending {
+            let (shard, result, prepared) = replies.recv().map_err(|_| writer_gone())?;
+            let mut batch = prepared.into_batch();
+            batch.clear();
+            batches[shard] = batch;
+            ids[shard] = result?;
+        }
+        let id = |&(shard, pos): &(u32, u32)| router.global_id(shard as usize, ids[shard as usize][pos as usize]).0;
+        triples.extend(slots.as_chunks::<3>().0.iter().map(|[s, p, o]| (id(s), id(p), id(o))));
+    }
+    Ok(triples)
 }
 
 /// Accumulates keys into dictionary batches and id triples into the graph.

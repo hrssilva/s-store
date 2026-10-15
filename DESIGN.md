@@ -67,14 +67,34 @@ A quad `(g, s, p, o)` is the triple `(s, p', o)` in graph `g`'s tree.
   (sequential load 52.0 s either way, measured interleaved). A load into a
   non-empty store keeps first-seen ids.
 - **Parallel N-Triples load** (`load::load_parallel`): worker threads parse
-  line-aligned byte ranges and prepare (sort and group) their own batches;
-  the calling thread only interns them and collects triples, taking one
-  batch per worker in turn. Arrival order would scatter related terms'
-  ids (graph +6%, a 4-row chain 0.09 -> 6.4 ms on the s-bench file), which
-  the term-order renumbering above undoes. 7 workers load that file in
-  ~26-29 s vs ~49-52 s sequentially (interning is then the bottleneck).
-  Turtle can't be split at arbitrary lines (prefixes, multi-line
-  statements) and stays sequential.
+  line-aligned byte ranges and prepare (sort and group) their own batches.
+  Into a non-empty store the calling thread interns them and collects
+  triples, taking one batch per worker in turn. Arrival order would
+  scatter related terms' ids (graph +6%, a 4-row chain 0.09 -> 6.4 ms on
+  the s-bench file), which the term-order renumbering above undoes for
+  fresh loads. Turtle can't be split at arbitrary lines (prefixes,
+  multi-line statements) and stays sequential.
+- **Sharded interning for fresh loads** (`load::load_sharded`): with one
+  writer, interning was 75% of a 12-worker load (small.nt, 4.9M triples:
+  writer interning 7.2 s, graph build 2.2 s, writer waiting on parsers
+  0.09 s; 9.6 s in all vs 11.1 s with one worker). Into an empty
+  dictionary, the loader now shards it by key range like s-bench's
+  `nt_dict_file_bench` (bounds from a 64-range sample, 32 shards per
+  writer dealt round-robin; as many writers as workers, since a worker
+  waiting for its ids sleeps). Workers route each key, send each shard's
+  sub-batch to its writer, wait for the ids and keep their triples with
+  shard-encoded ids (`ShardRouter::global_id`). At the end s-dict's
+  `concat_in_term_order` joins the shards' blocks, which already
+  partition the keys in order, into one dictionary with term-rank ids
+  without decoding a term, and the triples are remapped per worker in
+  parallel. The result is the term-order dictionary a sequential load
+  renumbers to, with the same ids. Building with `--features parallel`
+  also makes s-graph's bulk build use rayon (2.2 -> 0.95 s on small.nt,
+  identical tree). small.nt with 12 workers: 9.6 s -> 2.7 s (sample 0.04 s,
+  parse + intern 1.75 s, join + remap 0.06 s, build 0.9 s); data.nt (19.7M
+  triples): 92 s with one worker -> 18.3 s (intern 14 s, which grows
+  faster than the data, as with one writer: inserts get dearer as blocks
+  fill). 6 or 8 writers are within noise of 12; 4 add ~20%.
 - **Trade-off**: fixed cost per graph (tree metadata + first block). Fine for
   datasets with a moderate number of graphs; "one graph per statement" data
   would want a different partitioning (e.g. graph id folded into a dimension).
