@@ -54,6 +54,21 @@ fn closures_with_both_ends_bound_or_free() {
 }
 
 #[test]
+fn closures_with_both_ends_free_start_from_every_node() {
+    let st = chain();
+    let count = |q: &str| select(&st, q).len();
+    assert_eq!(count("SELECT * WHERE { ?s ex:r* ?o }"), 7 + 2, "every node to itself, plus x->y and z->y");
+    assert_eq!(count("SELECT * WHERE { ?s ex:r+ ?o }"), 2, "only nodes with an r edge");
+    assert_eq!(count("SELECT * WHERE { ?s ^ex:r+ ?o }"), 2, "y back to x and z");
+    assert_eq!(count("SELECT * WHERE { ?s ^ex:q* ?o }"), 7 + 2, "x and z back to a");
+    assert_eq!(count("SELECT * WHERE { ?s (ex:q/ex:r)* ?o }"), 7 + 1, "only a starts a q/r step");
+    assert_eq!(count("SELECT * WHERE { ?s (ex:r|^ex:q)+ ?o }"), 4, "x and z reach y (by r) and a (by ^q); y and a step nowhere");
+    assert_eq!(count("SELECT * WHERE { ?s ex:nothing* ?o }"), 7);
+    assert_eq!(count("SELECT * WHERE { ?s ex:nothing+ ?o }"), 0);
+    assert_eq!(count("SELECT * WHERE { GRAPH ?g { ?s ex:p* ?o } }"), 0, "no named graphs");
+}
+
+#[test]
 fn negated_property_sets() {
     let st = chain();
     assert_eq!(select(&st, "SELECT ?o WHERE { ex:a !ex:p ?o }"), iris(&["x", "z"]));

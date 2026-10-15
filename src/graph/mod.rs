@@ -23,7 +23,7 @@ pub use partition::{Partition, Tree};
 pub use predicates::PredicateTable;
 
 use s_dict::TermId;
-use s_graph::tree::Scan;
+use s_graph::tree::{ContainsBatchWorkspace, Scan};
 use s_graph::{BlockStorage, Triple};
 use std::collections::BTreeMap;
 use std::collections::btree_map;
@@ -167,9 +167,10 @@ impl<S: BlockStorage> QuadIndex<S> {
     }
 
     /// [`Self::contains`] for each `(s, p, o)` of `quads` in `graph`, into
-    /// `out` in input order; `probes` is scratch for the tree coordinates
-    /// (reused across calls). One batched s-graph descent for all of them.
-    pub fn contains_batch_into(&self, graph: GraphName, quads: &[(TermId, TermId, TermId)], probes: &mut Vec<Triple>, out: &mut Vec<bool>) {
+    /// `out` in input order; `probes` and `sort` are scratch for the tree
+    /// coordinates and s-graph's sort (reused across calls). One batched
+    /// s-graph descent for all of them.
+    pub fn contains_batch_into(&self, graph: GraphName, quads: &[(TermId, TermId, TermId)], probes: &mut Vec<Triple>, out: &mut Vec<bool>, sort: &mut ContainsBatchWorkspace) {
         let Some(part) = self.partition(graph) else {
             out.clear();
             out.resize(quads.len(), false);
@@ -179,7 +180,7 @@ impl<S: BlockStorage> QuadIndex<S> {
         // An unknown predicate becomes `u32::MAX`, never a dense id, so the
         // probe misses.
         probes.extend(quads.iter().map(|&(s, p, o)| (s.0, self.predicates.get(p).unwrap_or(u32::MAX), o.0)));
-        part.contains_batch_into(probes, out);
+        part.contains_batch_into(probes, out, sort);
     }
 
     /// Drops every quad of `graph`.
@@ -362,11 +363,11 @@ mod tests {
         let q = sample();
         let quads = [t(3, 51, 4), t(1, 50, 2), t(3, 99, 4), t(5, 50, 6), t(1, 51, 2)];
         let (mut probes, mut out) = (Vec::new(), Vec::new());
-        q.contains_batch_into(G1, &quads, &mut probes, &mut out);
+        q.contains_batch_into(G1, &quads, &mut probes, &mut out, &mut ContainsBatchWorkspace::default());
         assert_eq!(out, vec![true, true, false, false, false]);
-        q.contains_batch_into(GraphName::Default, &quads, &mut probes, &mut out);
+        q.contains_batch_into(GraphName::Default, &quads, &mut probes, &mut out, &mut ContainsBatchWorkspace::default());
         assert_eq!(out, vec![false, true, false, false, false]);
-        q.contains_batch_into(GraphName::Named(TermId(7)), &quads, &mut probes, &mut out);
+        q.contains_batch_into(GraphName::Named(TermId(7)), &quads, &mut probes, &mut out, &mut ContainsBatchWorkspace::default());
         assert_eq!(out, vec![false; 5], "a missing graph holds nothing");
     }
 

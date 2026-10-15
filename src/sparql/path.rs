@@ -13,12 +13,14 @@
 //! [`PatternBackend`] whose scans skip triples an earlier graph already
 //! produced, so merged graphs behave as an RDF merge (a set).
 
+use super::idset::IdSet;
 use crate::graph::Partition;
 use s_graph::automaton::{PathAutomaton, Transition};
 use s_graph::join::PatternBackend;
 use s_graph::traversal::{Direction, Step};
-use s_graph::tree::Scan;
+use s_graph::tree::{ContainsBatchWorkspace, DimRestriction, Scan};
 use s_graph::{BlockStorage, Triple};
+use std::ops::ControlFlow;
 
 /// A dense predicate id that matches nothing (outside every domain).
 pub const NO_PREDICATE: u32 = u32::MAX;
@@ -159,26 +161,71 @@ impl<'a, S: BlockStorage> View<'a, S> {
         }
     }
 
+    /// The graphs the view reads.
+    fn parts(&self) -> &[&'a Partition<S>] {
+        match self {
+            View::Empty => &[],
+            View::One(part) => std::slice::from_ref(part),
+            View::Merged(parts) => parts,
+        }
+    }
+
+    /// Adds to `set` every `dim` end (0: subject, 2: object) of the triples
+    /// with dense predicate `predicate`: s-graph streams the tree's
+    /// projection onto that position (`restricted_descent_visit`, pruned by
+    /// the predicate at every level) and the set absorbs repeats, so
+    /// nothing is buffered or sorted.
+    pub fn ends_into(self, predicate: u32, dim: usize, set: &mut IdSet) {
+        let restrictions = [DimRestriction::Free, DimRestriction::Exact(predicate), DimRestriction::Free];
+        for part in self.parts() {
+            let _: ControlFlow<()> = part.tree().restricted_descent_visit(restrictions, dim, |id| {
+                set.insert(id);
+                ControlFlow::Continue(())
+            });
+        }
+    }
+
+    /// Adds to `set` every subject and object: the nodes of the graph.
+    /// One scan per graph; the set itself merges graphs, so a merged view
+    /// needs none of [`ViewScan`]'s cross-graph checks.
+    pub fn nodes_into(self, set: &mut IdSet) {
+        for part in self.parts() {
+            part.scan([None; 3]).for_each(|(s, _, o)| {
+                set.insert(s);
+                set.insert(o);
+            });
+        }
+    }
+
     /// [`Self::contains`] for every probe, into `out` in input order, with
-    /// one batched s-graph descent per graph; `scratch` holds a merged
-    /// view's per-graph answers.
-    pub fn contains_batch_into(self, probes: &[Triple], out: &mut Vec<bool>, scratch: &mut Vec<bool>) {
+    /// one batched s-graph descent per graph; `scratch` holds s-graph's
+    /// sort buffers and a merged view's per-graph answers.
+    pub fn contains_batch_into(self, probes: &[Triple], out: &mut Vec<bool>, scratch: &mut BatchScratch) {
         match self {
             View::Empty => {
                 out.clear();
                 out.resize(probes.len(), false);
             }
-            View::One(part) => part.contains_batch_into(probes, out),
+            View::One(part) => part.contains_batch_into(probes, out, &mut scratch.sort),
             View::Merged(parts) => {
                 out.clear();
                 out.resize(probes.len(), false);
                 for part in parts {
-                    part.contains_batch_into(probes, scratch);
-                    out.iter_mut().zip(scratch.iter()).for_each(|(hit, &found)| *hit |= found);
+                    part.contains_batch_into(probes, &mut scratch.hits, &mut scratch.sort);
+                    out.iter_mut().zip(scratch.hits.iter()).for_each(|(hit, &found)| *hit |= found);
                 }
             }
         }
     }
+}
+
+/// Reusable buffers of [`View::contains_batch_into`].
+#[derive(Default)]
+pub struct BatchScratch {
+    /// s-graph's probe sort.
+    sort: ContainsBatchWorkspace,
+    /// One graph's answers, in a merged view.
+    hits: Vec<bool>,
 }
 
 /// Triples of a later merged graph checked one by one before switching to
@@ -203,13 +250,13 @@ pub struct ViewScan<'a, S: BlockStorage> {
     /// next one to yield.
     pending: Vec<Triple>,
     held: Vec<bool>,
-    scratch: Vec<bool>,
+    scratch: BatchScratch,
     next: usize,
 }
 
 impl<'a, S: BlockStorage> ViewScan<'a, S> {
     fn new(parts: &'a [&'a Partition<S>], current: Option<Scan<'a, S>>, bounds: [Option<u32>; 3]) -> Self {
-        Self { parts, index: 0, current, bounds, singles: 0, pending: Vec::new(), held: Vec::new(), scratch: Vec::new(), next: 0 }
+        Self { parts, index: 0, current, bounds, singles: 0, pending: Vec::new(), held: Vec::new(), scratch: BatchScratch::default(), next: 0 }
     }
 }
 
@@ -350,7 +397,7 @@ mod tests {
         assert_eq!(all, vec![(1, 0, 2), (2, 0, 3), (5, 0, 6)]);
         assert_eq!(reach(&star(0), view, 1), vec![1, 2, 3], "paths cross graphs of a merge");
         assert!(view.contains(2, 0, 3));
-        let (mut out, mut scratch) = (Vec::new(), Vec::new());
+        let (mut out, mut scratch) = (Vec::new(), BatchScratch::default());
         view.contains_batch_into(&[(2, 0, 3), (9, 0, 9), (5, 0, 6), (1, 0, 2)], &mut out, &mut scratch);
         assert_eq!(out, vec![true, false, true, true], "a triple is in a merge if any graph holds it");
         View::One(&b).contains_batch_into(&[(5, 0, 6), (2, 0, 3)], &mut out, &mut scratch);

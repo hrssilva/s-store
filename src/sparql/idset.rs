@@ -53,6 +53,17 @@ impl IdSet {
         *word |= 1 << (id % 64);
     }
 
+    /// Inserts `id` if the bitmap covers it, returning whether it was new;
+    /// `None` (nothing inserted) for an id beyond the bitmap.
+    pub fn insert_covered(&mut self, id: u32) -> Option<bool> {
+        let word = *self.words.get((id / 64) as usize)?;
+        let new = word & (1 << (id % 64)) == 0;
+        if new {
+            self.insert(id);
+        }
+        Some(new)
+    }
+
     /// Makes ids inserted beyond the bitmap searchable; call after the last
     /// insert and before `contains`.
     pub fn freeze(&mut self) {
@@ -65,6 +76,22 @@ impl IdSet {
             Some(word) => word & (1 << (id % 64)) != 0,
             None => self.others.binary_search(&id).is_ok(),
         }
+    }
+
+    /// The members in ascending order; call [`Self::freeze`] first.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        let bits = self.words.iter().enumerate().filter(|(_, w)| **w != 0).flat_map(|(i, &w)| {
+            let base = i as u32 * 64;
+            let mut rest = w;
+            std::iter::from_fn(move || {
+                (rest != 0).then(|| {
+                    let bit = rest.trailing_zeros();
+                    rest &= rest - 1;
+                    base + bit
+                })
+            })
+        });
+        bits.chain(self.others.iter().copied())
     }
 
     pub fn clear(&mut self) {
@@ -98,6 +125,28 @@ mod tests {
         for id in [1, 65, 198, 200, 4999, 0xF000_0000] {
             assert!(!set.contains(id), "{id}");
         }
+    }
+
+    #[test]
+    fn covered_inserts_report_novelty() {
+        let mut set = IdSet::new(128);
+        assert_eq!(set.insert_covered(70), Some(true));
+        assert_eq!(set.insert_covered(70), Some(false));
+        assert_eq!(set.insert_covered(128), None);
+        set.freeze();
+        assert!(set.contains(70) && !set.contains(128));
+    }
+
+    #[test]
+    fn iterates_members_in_ascending_order() {
+        let mut set = IdSet::new(200);
+        for id in [199, 5000, 0, 64, 63, 4000, 64] {
+            set.insert(id);
+        }
+        set.freeze();
+        assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 63, 64, 199, 4000, 5000]);
+        set.clear();
+        assert_eq!(set.iter().count(), 0);
     }
 
     #[test]

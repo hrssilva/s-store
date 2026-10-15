@@ -46,7 +46,7 @@ fn main() {
     binds.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
 
     let source = unsafe { FileStream::open(&path, 4 << 20).expect("open") };
-    let mut store = Store::new();
+    let mut store: Store = Store::with_config(s_store::store::StoreConfig { block_capacity: std::env::var("BLOCK").ok().and_then(|b| b.parse().ok()).unwrap_or(s_graph::DEFAULT_BLOCK_CAPACITY) });
     let t0 = Instant::now();
     load(&mut store, source, Format::NTriples, &LoadOptions::default()).expect("load");
     store.shrink_to_fit();

@@ -170,6 +170,23 @@ class 18.5 → 0.75 ms, of the busiest predicate 195 → 68 ms, the predicate
 histogram 352 → 234 ms (one traversal per predicate; a single traversal
 counting all predicates at once would need s-graph support).
 
+**Paths with both ends free** (`?x p* ?y`): only nodes with an edge
+matching one of the automaton's start transitions can take a step, so walks
+start from those alone, collected into an id set by s-graph's projection
+`query_one_bound_into` (distinct subjects or objects of a predicate, deduped
+in the descent). When the path matches zero-length paths, one scan per graph
+puts every subject and object in a second id set, and each node that is not a
+start pairs with itself only. Nodes come out in id order. The benchmark's
+`subClassOf*` closure on the 500k-subject file went from 49 s (a walk, with
+its µs-scale bound lookups, from each of ~1M nodes) to 0.3 s, mostly that
+node scan.
+
+**DISTINCT aggregates without GROUP BY** (`COUNT(DISTINCT ?v)`, ...) keep the
+seen values in an id set rather than a hashed `RowSet`; query-local ids go to
+a small `RowSet` aside. Ungrouped aggregation also no longer hashes the empty
+group key per solution. `COUNT(DISTINCT ?s)` over every triple: 925 → 382 ms
+on the 500k-subject file, now mostly s-graph's full scan.
+
 **Expressions** use `Copy` values over one per-query text arena: constants
 are decoded once into a frozen prefix; per-row scratch is truncated after each
 evaluation. ORDER BY decodes each *distinct* key term once and sorts rows by

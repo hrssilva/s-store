@@ -9,7 +9,7 @@
 //! insert.
 
 use super::domain::Domains;
-use s_graph::tree::{RadixTreeDfsInterleavedVarSkipUnrolledGeneric, Scan};
+use s_graph::tree::{ContainsBatchWorkspace, RadixTreeDfsInterleavedVarSkipUnrolledGeneric, Scan};
 use s_graph::{BlockStorage, BulkBuildBudget, Triple};
 
 pub type Tree<S> = RadixTreeDfsInterleavedVarSkipUnrolledGeneric<S>;
@@ -78,10 +78,11 @@ impl<S: BlockStorage> Partition<S> {
     }
 
     /// [`Self::contains`] for every triple of `triples`, into `out` in input
-    /// order. s-graph sorts the probes and shares descents between them, so
-    /// this is far cheaper than one `contains` per triple.
-    pub fn contains_batch_into(&self, triples: &[Triple], out: &mut Vec<bool>) {
-        self.tree.contains_batch_into(triples, out);
+    /// order. s-graph sorts the probes (in `sort`, reused across calls) and
+    /// shares descents between them, so this is far cheaper than one
+    /// `contains` per triple.
+    pub fn contains_batch_into(&self, triples: &[Triple], out: &mut Vec<bool>, sort: &mut ContainsBatchWorkspace) {
+        self.tree.contains_batch_into(triples, out, sort);
     }
 
     /// Matching triples in the tree's Morton order; `None` is a wildcard.
@@ -176,9 +177,9 @@ mod tests {
         let p = P::from_triples(vec![(1, 0, 2), (2, 1, 1), (7, 0, 3)], 4096);
         let probes = [(7, 0, 3), (1, 0, 3), (1, 0, 2), (1, 0, 2), (u32::MAX, 0, 2), (2, u32::MAX, 1)];
         let mut out = vec![true; 10];
-        p.contains_batch_into(&probes, &mut out);
+        p.contains_batch_into(&probes, &mut out, &mut ContainsBatchWorkspace::default());
         assert_eq!(out, vec![true, false, true, true, false, false], "duplicates repeat, out-of-domain is absent");
-        p.contains_batch_into(&[], &mut out);
+        p.contains_batch_into(&[], &mut out, &mut ContainsBatchWorkspace::default());
         assert!(out.is_empty());
     }
 

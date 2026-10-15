@@ -30,6 +30,39 @@ The store is generic over s-graph's storage backends (`Heap` by default;
 See [DESIGN.md](DESIGN.md) for the architecture, the reasoning behind it and
 the known gaps.
 
+## HTTP endpoint
+
+`examples/server.rs` serves a store over HTTP (standard library only):
+
+```sh
+cargo run --release --example server -- [--bind 127.0.0.1:7878] [FILE[=GRAPH]]...
+# e.g. data.nt into the default graph, more.ttl into a named graph:
+cargo run --release --example server -- data.nt more.ttl=http://ex/g1
+```
+
+Files (`.nt`, `.ttl`) are loaded before serving, read through memory-mapped
+windows. Then open `http://127.0.0.1:7878/` for a page that runs queries and
+uploads files, or use the endpoints directly:
+
+| Endpoint | |
+|---|---|
+| `GET /sparql?query=...`, `POST /sparql` | Query in the URL, a form (`query=...`) or the body (`Content-Type: application/sparql-query`). SELECT/ASK answer as SPARQL JSON results, or TSV with `format=tsv` / `Accept: text/tab-separated-values`; CONSTRUCT/DESCRIBE as N-Triples. |
+| `POST /load?format=nt\|ttl[&graph=IRI][&base=IRI]` | Loads the request body into the default graph or `graph`. |
+| `GET /stats` | Triple count and memory use. |
+
+```sh
+curl --get localhost:7878/sparql --data-urlencode 'query=SELECT * WHERE { ?s ?p ?o } LIMIT 10'
+curl -H 'Accept: text/tab-separated-values' --data-urlencode 'query=SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p' localhost:7878/sparql
+curl -X POST --data-binary @file.ttl 'localhost:7878/load?format=ttl&graph=http://ex/g1'
+```
+
+Queries run concurrently; a load waits for running queries and holds off new
+ones. Each query's and load's time is logged to stderr. It is a development
+tool: no authentication (it binds to localhost unless `--bind` says
+otherwise), uploads are held in memory (up to 1 GiB; load large files as
+arguments instead), request bodies need a `Content-Length` (no chunked
+encoding), and each connection serves one request.
+
 ## Testing
 
 ```sh

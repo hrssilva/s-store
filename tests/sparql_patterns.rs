@@ -25,6 +25,29 @@ fn single_pattern_with_constants() {
     assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:knows ex:nobody }"), rows(&[]));
 }
 
+/// A pattern with one free position, after substitution, streams that
+/// position alone from s-graph; every position, a dense predicate and an
+/// early stop must still come out right.
+#[test]
+fn patterns_with_one_free_position() {
+    let st = people();
+    assert_eq!(select(&st, "SELECT ?o WHERE { ex:alice ex:knows ?o }"), rows(&[&["<http://ex/bob>"], &["<http://ex/carol>"]]));
+    assert_eq!(select(&st, "SELECT ?p WHERE { ex:bob ?p ex:carol }"), rows(&[&["<http://ex/knows>"]]));
+    assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:age 25 }"), rows(&[&["<http://ex/bob>"]]));
+    assert_eq!(select(&st, "SELECT ?o WHERE { ex:alice ex:knows ?o } LIMIT 1").len(), 1);
+    assert!(ask(&st, "ASK { ?s ex:knows ex:alice }"));
+    // Bound by an outer solution: one lookup per row (BIND forces a join).
+    assert_eq!(
+        select(&st, "SELECT ?x ?n WHERE { ?x ex:age ?a OPTIONAL { ?x ex:email ?e } BIND(1 AS ?one) OPTIONAL { ?x ex:name ?n FILTER(?one = 1) } }").len(),
+        3
+    );
+    // A merged default graph keeps the generic path.
+    let mut merged = people();
+    load_ttl(&mut merged, "ex:alice ex:knows ex:bob, ex:erin .", GraphRef::Named("<http://g1>"));
+    load_ttl(&mut merged, "ex:alice ex:knows ex:erin, ex:frank .", GraphRef::Named("<http://g2>"));
+    assert_eq!(select(&merged, "SELECT ?o FROM <http://g1> FROM <http://g2> WHERE { ex:alice ex:knows ?o }").len(), 3, "bob, erin once, frank");
+}
+
 #[test]
 fn star_and_chain_joins() {
     let st = people();

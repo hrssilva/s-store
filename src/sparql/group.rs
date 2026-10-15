@@ -13,6 +13,7 @@ use super::path::View;
 use crate::graph::Partition;
 use super::expr::{term_value, value_id};
 use super::hash::RowSet;
+use super::idset::IdSet;
 use super::plan::*;
 use super::value::{self, Num, Value};
 use s_graph::BlockStorage;
@@ -51,6 +52,15 @@ fn add(a: Num, b: Num) -> Option<Num> {
         (Num::Int(x), Num::Int(y)) => x.checked_add(y).map(Num::Int),
         _ => Some(Num::of_kind(kind, a.as_f64() + b.as_f64())),
     }
+}
+
+/// The values a DISTINCT aggregate has seen.
+enum Seen {
+    /// Per group (`(group, value)`, or `(group, solution...)` for `*`).
+    Rows(RowSet),
+    /// Ungrouped, over an expression: one bit per dictionary id, query-local
+    /// ids aside. No hashing for the common `COUNT(DISTINCT ?v)`.
+    Ids(IdSet, RowSet),
 }
 
 /// A GROUP s-graph can count without listing the matches: the input is one
@@ -158,14 +168,22 @@ impl<S: BlockStorage> Ctx<'_, S> {
         let input_scope = self.plan.scope(input);
         let mut groups = RowSet::new(keys.len());
         let mut accs: Vec<Acc> = Vec::new();
-        let mut distinct: Vec<RowSet> = aggs.iter().map(|a| RowSet::new(if a.expr.is_some() { 2 } else { 1 + input_scope.len() })).collect();
+        let mut distinct: Vec<Seen> = aggs
+            .iter()
+            .map(|a| match (a.distinct && a.expr.is_some() && keys.is_empty(), a.expr) {
+                (true, _) => Seen::Ids(self.id_set(env), RowSet::new(1)),
+                (false, Some(_)) => Seen::Rows(RowSet::new(2)),
+                (false, None) => Seen::Rows(RowSet::new(1 + input_scope.len())),
+            })
+            .collect();
         let mut key = vec![UNBOUND; keys.len()];
         let mut distinct_key: Vec<u32> = Vec::new();
         let _ = self.eval(env, input, active, row, &mut |env, row| {
             for (slot, gk) in key.iter_mut().zip(keys) {
                 *slot = self.expr_id(env, gk.expr, row, active).unwrap_or(UNBOUND);
             }
-            let (g, new) = groups.insert(&key);
+            // Ungrouped: one group, no key to hash per solution.
+            let (g, new) = if keys.is_empty() { (0, groups.is_empty() && groups.insert(&[]).1) } else { groups.insert(&key) };
             if new {
                 accs.extend(aggs.iter().map(|a| Acc::new(a.kind)));
             }
@@ -175,14 +193,21 @@ impl<S: BlockStorage> Ctx<'_, S> {
                     Some(e) => self.expr_id(env, e, row, active),
                 };
                 if agg.distinct {
-                    distinct_key.clear();
-                    distinct_key.push(g);
-                    match (agg.expr, value) {
-                        (None, _) => distinct_key.extend(input_scope.iter().map(|&s| row[s as usize])),
-                        (Some(_), Some(v)) => distinct_key.push(v),
-                        (Some(_), None) => distinct_key.push(UNBOUND),
-                    }
-                    if !distinct[j].insert(&distinct_key).1 {
+                    let new = match &mut distinct[j] {
+                        // Unbound inputs are never accumulated.
+                        Seen::Ids(ids, others) => value.is_some_and(|v| ids.insert_covered(v).unwrap_or_else(|| others.insert(&[v]).1)),
+                        Seen::Rows(seen) => {
+                            distinct_key.clear();
+                            distinct_key.push(g);
+                            match (agg.expr, value) {
+                                (None, _) => distinct_key.extend(input_scope.iter().map(|&s| row[s as usize])),
+                                (Some(_), Some(v)) => distinct_key.push(v),
+                                (Some(_), None) => distinct_key.push(UNBOUND),
+                            }
+                            seen.insert(&distinct_key).1
+                        }
+                    };
+                    if !new {
                         continue;
                     }
                 }
@@ -190,6 +215,11 @@ impl<S: BlockStorage> Ctx<'_, S> {
             }
             CONTINUE
         });
+        for seen in distinct {
+            if let Seen::Ids(ids, _) = seen {
+                Self::return_id_set(env, ids);
+            }
+        }
         if groups.is_empty() && keys.is_empty() {
             groups.insert(&[]);
             accs.extend(aggs.iter().map(|a| Acc::new(a.kind)));

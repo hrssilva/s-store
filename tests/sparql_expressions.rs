@@ -181,6 +181,27 @@ fn aggregates() {
     assert_eq!(select(&st, "SELECT (SUM(?v) AS ?s) WHERE { ?x ex:v ?v }"), rows(&[&["-"]]));
 }
 
+/// Without GROUP BY, DISTINCT aggregates keep their seen values in an id
+/// set: stored terms, terms the query computed, and unbound inputs.
+#[test]
+fn distinct_aggregates_without_grouping() {
+    let st = store_with(
+        r#"
+ex:a ex:p ex:b, ex:c ; ex:q "x", ex:a .
+ex:b ex:p ex:b ; ex:q "y" .
+ex:c ex:r ex:a .
+"#,
+    );
+    let one = |q: &str| select(&st, q);
+    assert_eq!(one("SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ?p ?o }"), rows(&[&[&int(3)]]));
+    assert_eq!(one("SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ?p ?o }"), rows(&[&[&int(5)]]));
+    assert_eq!(one("SELECT (COUNT(DISTINCT STRLEN(STR(?o))) AS ?n) WHERE { ?s ?p ?o }"), rows(&[&[&int(2)]]), "computed lengths 11 and 1");
+    assert_eq!(one("SELECT (COUNT(DISTINCT ?q) AS ?n) (COUNT(?q) AS ?all) WHERE { ?s ex:p ?o OPTIONAL { ?o ex:q ?q } }"), rows(&[&[&int(1), &int(2)]]));
+    assert_eq!(one("SELECT (SUM(DISTINCT STRLEN(STR(?o))) AS ?n) WHERE { ?s ?p ?o }"), rows(&[&[&int(12)]]));
+    assert_eq!(one("SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s ex:none ?o }"), rows(&[&[&int(0)]]));
+    assert_eq!(select(&st, "SELECT ?s (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?s").len(), 3, "grouped DISTINCT keeps its keyed sets");
+}
+
 /// Single-pattern COUNTs are answered by s-graph's counting traversal (or
 /// the graph's size); these pin the results for every shape it takes.
 #[test]

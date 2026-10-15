@@ -14,14 +14,15 @@
 //! id space, checked equal (through the predicate table) on output.
 
 use super::exec::{Active, CONTINUE, Ctx, Env, Flow, Sink};
-use super::path::View;
+use super::path::{BatchScratch, View};
 use super::plan::*;
 use crate::dict::LOCAL_ID_BASE;
 use crate::graph::Partition;
 use s_graph::{BlockStorage, Triple};
 use s_graph::graph::{JoinQuery, Term as JTerm, TriplePattern as JTriple};
 use s_graph::native_join::NativeJoin;
-use s_graph::traversal::HopRange;
+use s_graph::tree::DimRestriction;
+use s_graph::traversal::{Direction, HopRange};
 use std::ops::ControlFlow;
 
 /// How many solutions a [`Node::Check`] buffers before probing them all in
@@ -41,7 +42,7 @@ pub struct CheckBuffers {
     rows: Vec<u32>,
     probes: Vec<Triple>,
     hits: Vec<bool>,
-    scratch: Vec<bool>,
+    scratch: BatchScratch,
     current: Vec<u32>,
 }
 
@@ -147,6 +148,21 @@ impl<S: BlockStorage> Ctx<'_, S> {
         let Some(i) = next.filter(|&i| i < triples.len()) else { return k(env, row) };
         let done = if triples.len() > 64 { done + 1 } else { done | (1 << i) };
         let Some((bounds, pos)) = self.bounds(&triples[i], row) else { return CONTINUE };
+        // One free position over one graph: s-graph streams just that
+        // position, pruned by the other two at every level (faster than a
+        // scan, which also decodes the bound positions), and stops when `k`
+        // does.
+        if let View::One(part) = view
+            && bounds.iter().filter(|b| b.is_none()).count() == 1
+        {
+            let free = bounds.iter().position(Option::is_none).expect("one free position");
+            let restrictions = bounds.map(|b| b.map_or(DimRestriction::Free, DimRestriction::Exact));
+            let mut t = bounds.map(|b| b.unwrap_or(0));
+            return part.tree().restricted_descent_visit(restrictions, free, |value| {
+                t[free] = value;
+                self.emit_triple(env, &pos, (t[0], t[1], t[2]), row, &mut |env, row| self.nested_loop(env, view, triples, done, row, k))
+            });
+        }
         for t in view.scan(bounds) {
             self.emit_triple(env, &pos, t, row, &mut |env, row| self.nested_loop(env, view, triples, done, row, k))?;
         }
@@ -320,21 +336,54 @@ impl<S: BlockStorage> Ctx<'_, S> {
                     }
                     (Pos::Bound(a), Pos::Free(slot)) => self.walk(env, &automata[0], view, a, &mut |env, row, node| self.emit_pair(env, Pos::Bound(a), Pos::Free(slot), a, node, row, k), row),
                     (Pos::Free(slot), Pos::Bound(b)) => self.walk(env, &automata[1], view, b, &mut |env, row, node| self.emit_pair(env, Pos::Free(slot), Pos::Bound(b), node, b, row, k), row),
-                    (Pos::Free(ss), Pos::Free(os)) => {
-                        let mut nodes: Vec<u32> = view.scan([None; 3]).flat_map(|t| [t.0, t.2]).collect();
-                        nodes.sort_unstable();
-                        nodes.dedup();
-                        for start in nodes {
-                            row[ss as usize] = start;
-                            let flow = self.walk(env, &automata[0], view, start, &mut |env, row, node| self.emit_pair(env, Pos::Bound(start), Pos::Free(os), start, node, row, k), row);
-                            row[ss as usize] = UNBOUND;
-                            flow?;
-                        }
-                        CONTINUE
-                    }
+                    (Pos::Free(ss), Pos::Free(os)) => self.walk_all(env, path, &automata[0], view, ss, os, row, k),
                 }
             }
         }
+    }
+
+    /// A path with both ends free. Only nodes with an edge matching one of
+    /// the start state's transitions can take a step, so the walks start
+    /// from those alone (found by s-graph projections, not by trying every
+    /// node); when the path matches zero-length paths, every other node of
+    /// the graph pairs with itself only. Nodes go in id order either way.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_all(&self, env: &mut Env, path: PathId, automaton: &s_graph::automaton::PathAutomaton, view: View<'_, S>, ss: Slot, os: Slot, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
+        let PathPlan::Automaton { automaton: nfa, zero_length } = &self.plan.paths[path as usize] else { unreachable!("automaton path") };
+        let mut starts = self.id_set(env);
+        for &(_, _, direction, p) in nfa.transitions.iter().filter(|t| t.0 == nfa.start) {
+            if direction != Direction::Incoming {
+                view.ends_into(p, 0, &mut starts);
+            }
+            if direction != Direction::Outgoing {
+                view.ends_into(p, 2, &mut starts);
+            }
+        }
+        starts.freeze();
+        let nodes = zero_length.then(|| {
+            let mut nodes = self.id_set(env);
+            view.nodes_into(&mut nodes);
+            nodes.freeze();
+            nodes
+        });
+        let mut flow = CONTINUE;
+        for start in nodes.as_ref().unwrap_or(&starts).iter() {
+            row[ss as usize] = start;
+            flow = if nodes.is_none() || starts.contains(start) {
+                self.walk(env, automaton, view, start, &mut |env, row, node| self.emit_pair(env, Pos::Bound(start), Pos::Free(os), start, node, row, k), row)
+            } else {
+                self.emit_pair(env, Pos::Bound(start), Pos::Free(os), start, start, row, k)
+            };
+            row[ss as usize] = UNBOUND;
+            if flow.is_break() {
+                break;
+            }
+        }
+        if let Some(nodes) = nodes {
+            Self::return_id_set(env, nodes);
+        }
+        Self::return_id_set(env, starts);
+        flow
     }
 
     /// Binds a path's free ends to `(a, b)` and calls `k`.

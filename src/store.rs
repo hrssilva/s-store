@@ -175,7 +175,7 @@ impl<S: BlockStorage> Store<S> {
         // dictionary's id limit, so its probe misses.
         let id = |k: &str| self.dict.lookup(k).unwrap_or(TermId(u32::MAX));
         let ids: Vec<(TermId, TermId, TermId)> = quads.iter().map(|&(s, p, o)| (id(s), id(p), id(o))).collect();
-        self.quads.contains_batch_into(g, &ids, &mut Vec::with_capacity(ids.len()), out);
+        self.quads.contains_batch_into(g, &ids, &mut Vec::with_capacity(ids.len()), out, &mut Default::default());
     }
 
     fn lookup_quad(&self, graph: GraphRef<'_>, s: &str, p: &str, o: &str) -> Option<(GraphName, TermId, TermId, TermId)> {
