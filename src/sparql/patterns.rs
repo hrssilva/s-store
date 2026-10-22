@@ -1,29 +1,31 @@
 //! Triple patterns and paths, delegated to s-graph.
 //!
-//! A BGP over one graph with more than one pattern becomes one s-graph
-//! [`NativeJoin`]: bound slots are substituted as constants, the remaining
-//! variables are join variables, and s-graph traverses the S/P/O trie for
-//! all patterns at once, streaming bindings without building relations.
-//! A single pattern is one bounded [`View::scan`]. A BGP over a merged
-//! default graph (`FROM` several graphs) joins pattern by pattern over
-//! merged scans, most-bound pattern first, since a native join runs within
-//! one tree.
+//! A BGP over one graph is one s-graph automaton ([`automata::Bgp`]): its
+//! patterns are the atoms of one register automaton that s-graph runs over
+//! the graph's FST, all patterns at once, streaming bindings without
+//! building relations. The automaton is compiled once per query and graph
+//! ([`BgpSearch`]); every evaluation passes the row's current bindings as
+//! parameters (`Search::visit_matching`), which s-graph pushes into the
+//! traversal, so a BGP joined per left solution is never recompiled. A BGP
+//! over a merged default graph (`FROM` several graphs) joins pattern by
+//! pattern over merged scans, most-bound pattern first, since an automaton
+//! runs over one FST.
 //!
-//! Predicates are dense ids in the trees. A variable seen in predicate
-//! position *and* in subject/object position is two join variables, one per
-//! id space, checked equal (through the predicate table) on output.
+//! Predicates are dense ids in the FSTs. A variable seen in predicate
+//! position *and* in subject/object position is two automaton variables,
+//! one per id space, checked equal (through the predicate table) on output.
 
 use super::exec::{Active, CONTINUE, Ctx, Env, Flow, Sink};
 use super::path::{BatchScratch, View};
 use super::plan::*;
 use crate::dict::LOCAL_ID_BASE;
 use crate::graph::Partition;
-use s_graph::{BlockStorage, Triple};
-use s_graph::graph::{JoinQuery, Term as JTerm, TriplePattern as JTriple};
-use s_graph::native_join::NativeJoin;
-use s_graph::tree::DimRestriction;
+use s_graph::automata::{self, Binding, MutableFstSource, Schedule, Search, Term};
+use s_graph::query_ops::BgpWorkspace;
 use s_graph::traversal::{Direction, HopRange};
+use s_graph::{BlockStorage, Triple};
 use std::ops::ControlFlow;
+use std::rc::Rc;
 
 /// How many solutions a [`Node::Check`] buffers before probing them all in
 /// one batch: large enough for s-graph to share most of the descents,
@@ -44,6 +46,32 @@ pub struct CheckBuffers {
     hits: Vec<bool>,
     scratch: BatchScratch,
     current: Vec<u32>,
+}
+
+/// The traversal schedule of BGP automata: every atom advances one FST
+/// level at a time, synchronized on shared variable bits (what s-graph's
+/// native join did). s-graph's default, `Adaptive`, chose a nested
+/// schedule on every workload shape measured (4.9M triples): a star join
+/// took 369 ms instead of 12.6 ms, `?a ?p ?b . ?b a ?c` 2.75 s instead of
+/// 167 ms; only a chain into a constant type was faster nested (38 vs
+/// 88 ms). See DESIGN.md.
+const SCHEDULE: Schedule = Schedule::Levels;
+
+/// A BGP compiled for one graph: an s-graph search and its variables.
+pub struct BgpSearch<'q, S: BlockStorage> {
+    /// `None` when a constant cannot occur (a predicate no graph uses).
+    search: Option<s_graph::query_ops::Bgp<MutableFstSource<'q, S>>>,
+    /// The automaton's variables by index: `(slot, predicate position?)`.
+    vars: Vec<(Slot, bool)>,
+}
+
+/// Reusable buffers of a [`BgpSearch`] run (pooled in `Env`): s-graph's
+/// workspace and the parameters taken from the row.
+#[derive(Default)]
+pub struct BgpBuffers {
+    ws: BgpWorkspace<u64>,
+    values: Vec<u32>,
+    bound: Vec<u64>,
 }
 
 /// A pattern position after substituting the current row.
@@ -75,8 +103,8 @@ fn bind(row: &mut [u32], slot: Slot, value: u32) -> Option<bool> {
     }
 }
 
-impl<S: BlockStorage> Ctx<'_, S> {
-    /// Resolves a pattern's bounds in tree coordinates; `None` when a bound
+impl<'q, S: BlockStorage> Ctx<'q, S> {
+    /// Resolves a pattern's bounds in FST coordinates; `None` when a bound
     /// term cannot occur (an unknown predicate, a query-local id).
     fn bounds(&self, t: &PTriple, row: &[u32]) -> Option<([Option<u32>; 3], [Pos; 3])> {
         let pos = [resolve(t.s, row), resolve(t.p, row), resolve(t.o, row)];
@@ -92,21 +120,112 @@ impl<S: BlockStorage> Ctx<'_, S> {
         Some((bounds, pos))
     }
 
-    /// `t`'s bounds in tree coordinates with `row` substituted (`None`
+    /// `t`'s bounds in FST coordinates with `row` substituted (`None`
     /// for a free position); `None` when a bound term cannot occur.
     pub(super) fn pattern_bounds(&self, t: &PTriple, row: &[u32]) -> Option<[Option<u32>; 3]> {
         self.bounds(t, row).map(|(bounds, _)| bounds)
     }
 
-    pub(super) fn bgp(&self, env: &mut Env, triples: &[PTriple], active: Active, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
+    pub(super) fn bgp(&self, env: &mut Env, range: Range, active: Active, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
+        let triples = self.plan.triples(range);
         if triples.is_empty() {
             return k(env, row);
         }
+        if let Some(part) = self.single(active) {
+            let key = (range.start, range.len, active.cache_key());
+            let cached = self.searches.borrow().get(&key).cloned();
+            let search = cached.unwrap_or_else(|| {
+                let search = Rc::new(self.compile_bgp(part, triples));
+                self.searches.borrow_mut().insert(key, search.clone());
+                search
+            });
+            return self.run_bgp(env, &search, row, k);
+        }
         match self.view(active) {
             View::Empty => CONTINUE,
-            View::One(part) if triples.len() > 1 => self.native_join(env, part, triples, row, k),
             view => self.nested_loop(env, view, triples, 0, row, k),
         }
+    }
+
+    /// Compiles `triples` into one s-graph automaton over `part`. Every
+    /// variable stays a variable (bindings arrive as parameters at run
+    /// time), so the search serves every row.
+    fn compile_bgp(&self, part: &'q Partition<S>, triples: &[PTriple]) -> BgpSearch<'q, S> {
+        let mut vars: Vec<(Slot, bool)> = Vec::new();
+        let mut patterns = Vec::with_capacity(triples.len());
+        for t in triples {
+            let mut terms = [Term::Const(0); 3];
+            for (i, position) in [t.s, t.p, t.o].into_iter().enumerate() {
+                terms[i] = match position {
+                    PTerm::Var(slot) => {
+                        let var = (slot, i == 1);
+                        Term::Var(vars.iter().position(|&v| v == var).unwrap_or_else(|| {
+                            vars.push(var);
+                            vars.len() - 1
+                        }))
+                    }
+                    PTerm::Const(id) if i == 1 => match self.dense(id) {
+                        Some(dense) => Term::Const(dense),
+                        None => return BgpSearch { search: None, vars },
+                    },
+                    // A query-local id lies outside every FST domain, which
+                    // s-graph compiles to an empty search.
+                    PTerm::Const(id) => Term::Const(id),
+                };
+            }
+            patterns.push(terms);
+        }
+        let machine = patterns.into_iter().fold(automata::Bgp::new(vars.len()), automata::Bgp::triple).schedule(SCHEDULE);
+        let search = part.tree().search(&machine).expect("a well-formed BGP over valid domains");
+        BgpSearch { search: Some(search), vars }
+    }
+
+    /// Runs a compiled BGP with `row`'s bindings as parameters, binding its
+    /// variables for each solution.
+    fn run_bgp(&self, env: &mut Env, bgp: &BgpSearch<'q, S>, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
+        let Some(search) = &bgp.search else { return CONTINUE };
+        let mut b = Self::bgp_buffers(env);
+        let width = bgp.vars.len();
+        b.values.clear();
+        b.values.resize(width, 0);
+        b.bound.clear();
+        b.bound.resize(width.div_ceil(64), 0);
+        let mut parameters = false;
+        for (j, &(slot, predicate)) in bgp.vars.iter().enumerate() {
+            let value = row[slot as usize];
+            if value == UNBOUND {
+                continue;
+            }
+            let Some(value) = (if predicate { self.dense(value) } else { (value < LOCAL_ID_BASE).then_some(value) }) else {
+                Self::return_bgp_buffers(env, b);
+                return CONTINUE;
+            };
+            b.values[j] = value;
+            b.bound[j / 64] |= 1 << (j % 64);
+            parameters = true;
+        }
+        let BgpBuffers { ws, values, bound } = &mut b;
+        let mut newly: Vec<Slot> = Vec::new();
+        let mut emit = |binding: Binding<'_>| {
+            newly.clear();
+            for (j, &(slot, predicate)) in bgp.vars.iter().enumerate() {
+                let value = if predicate { self.predicate_term(binding.values[j]) } else { binding.values[j] };
+                match bind(row, slot, value) {
+                    Some(true) => newly.push(slot),
+                    Some(false) => {}
+                    None => {
+                        newly.iter().for_each(|&s| row[s as usize] = UNBOUND);
+                        return CONTINUE;
+                    }
+                }
+            }
+            let flow = k(env, row);
+            newly.iter().for_each(|&s| row[s as usize] = UNBOUND);
+            flow
+        };
+        let flow = if parameters { search.visit_matching(ws, Binding { values, bound }, &mut emit) } else { search.visit(ws, &mut emit) };
+        Self::return_bgp_buffers(env, b);
+        flow
     }
 
     /// Binds the free positions of one matched triple, calls `k`, unbinds.
@@ -148,72 +267,10 @@ impl<S: BlockStorage> Ctx<'_, S> {
         let Some(i) = next.filter(|&i| i < triples.len()) else { return k(env, row) };
         let done = if triples.len() > 64 { done + 1 } else { done | (1 << i) };
         let Some((bounds, pos)) = self.bounds(&triples[i], row) else { return CONTINUE };
-        // One free position over one graph: s-graph streams just that
-        // position, pruned by the other two at every level (faster than a
-        // scan, which also decodes the bound positions), and stops when `k`
-        // does.
-        if let View::One(part) = view
-            && bounds.iter().filter(|b| b.is_none()).count() == 1
-        {
-            let free = bounds.iter().position(Option::is_none).expect("one free position");
-            let restrictions = bounds.map(|b| b.map_or(DimRestriction::Free, DimRestriction::Exact));
-            let mut t = bounds.map(|b| b.unwrap_or(0));
-            return part.tree().restricted_descent_visit(restrictions, free, |value| {
-                t[free] = value;
-                self.emit_triple(env, &pos, (t[0], t[1], t[2]), row, &mut |env, row| self.nested_loop(env, view, triples, done, row, k))
-            });
-        }
         for t in view.scan(bounds) {
             self.emit_triple(env, &pos, t, row, &mut |env, row| self.nested_loop(env, view, triples, done, row, k))?;
         }
         CONTINUE
-    }
-
-    fn native_join(&self, env: &mut Env, part: &Partition<S>, triples: &[PTriple], row: &mut [u32], k: &mut Sink<'_>) -> Flow {
-        // Join variables: (slot, predicate position?) pairs, in first-use order.
-        let mut vars: Vec<(Slot, bool)> = Vec::new();
-        let mut patterns = Vec::with_capacity(triples.len());
-        let mut var_of = |slot: Slot, predicate: bool| -> usize {
-            match vars.iter().position(|&v| v == (slot, predicate)) {
-                Some(i) => i,
-                None => {
-                    vars.push((slot, predicate));
-                    vars.len() - 1
-                }
-            }
-        };
-        for t in triples {
-            let Some((bounds, pos)) = self.bounds(t, row) else { return CONTINUE };
-            let term = |i: usize, var_of: &mut dyn FnMut(Slot, bool) -> usize| match (bounds[i], pos[i]) {
-                (Some(c), _) => JTerm::Const(c),
-                (None, Pos::Free(slot)) => JTerm::Var(var_of(slot, i == 1)),
-                (None, Pos::Bound(_)) => unreachable!("bound positions have bounds"),
-            };
-            patterns.push(JTriple { subject: term(0, &mut var_of), predicate: term(1, &mut var_of), object: term(2, &mut var_of) });
-        }
-        let query = JoinQuery { num_vars: vars.len(), patterns };
-        let Ok(plan) = NativeJoin::new(&query, part.tree()) else { return CONTINUE };
-        let mut ws = Self::join_workspace(env);
-        let mut newly: Vec<Slot> = Vec::with_capacity(vars.len());
-        let flow = plan.visit(&mut ws, |binding| {
-            newly.clear();
-            for (j, &(slot, predicate)) in vars.iter().enumerate() {
-                let value = if predicate { self.predicate_term(binding[j]) } else { binding[j] };
-                match bind(row, slot, value) {
-                    Some(true) => newly.push(slot),
-                    Some(false) => {}
-                    None => {
-                        newly.iter().for_each(|&s| row[s as usize] = UNBOUND);
-                        return CONTINUE;
-                    }
-                }
-            }
-            let flow = k(env, row);
-            newly.iter().for_each(|&s| row[s as usize] = UNBOUND);
-            flow
-        });
-        Self::return_join_workspace(env, ws);
-        flow
     }
 
     /// [`Node::Check`]: buffers `input`'s solutions, probes every pattern of
@@ -274,7 +331,7 @@ impl<S: BlockStorage> Ctx<'_, S> {
     /// solutions by membership. Two s-graph traversals and one bit per
     /// dictionary id, instead of a lookup or a probe per left solution.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn set_join(&self, env: &mut Env, left: NodeId, joined: &[PTriple], slot: Slot, kind: SetJoinKind, active: Active, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
+    pub(super) fn set_join(&self, env: &mut Env, left: NodeId, joined: Range, slot: Slot, kind: SetJoinKind, active: Active, row: &mut [u32], k: &mut Sink<'_>) -> Flow {
         let s = slot as usize;
         let mut matched = self.id_set(env);
         let mut flow = self.bgp(env, joined, active, row, &mut |env, row| {
@@ -290,7 +347,7 @@ impl<S: BlockStorage> Ctx<'_, S> {
         flow
     }
 
-    /// `t` with `solution` substituted, in tree coordinates; [`MISS`] when a
+    /// `t` with `solution` substituted, in FST coordinates; [`MISS`] when a
     /// term cannot occur in the data.
     fn probe(&self, t: &PTriple, solution: &[u32]) -> Triple {
         match self.bounds(t, solution) {

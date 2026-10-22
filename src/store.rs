@@ -31,7 +31,7 @@ pub struct QuadPattern<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct StoreConfig {
-    /// s-graph block capacity of every graph tree.
+    /// s-graph block capacity of every graph's FST.
     pub block_capacity: usize,
 }
 
@@ -175,7 +175,7 @@ impl<S: BlockStorage> Store<S> {
         // dictionary's id limit, so its probe misses.
         let id = |k: &str| self.dict.lookup(k).unwrap_or(TermId(u32::MAX));
         let ids: Vec<(TermId, TermId, TermId)> = quads.iter().map(|&(s, p, o)| (id(s), id(p), id(o))).collect();
-        self.quads.contains_batch_into(g, &ids, &mut Vec::with_capacity(ids.len()), out, &mut Default::default());
+        self.quads.contains_batch_into(g, &ids, &mut Vec::with_capacity(ids.len()), out);
     }
 
     fn lookup_quad(&self, graph: GraphRef<'_>, s: &str, p: &str, o: &str) -> Option<(GraphName, TermId, TermId, TermId)> {
@@ -214,13 +214,24 @@ impl<S: BlockStorage> Store<S> {
         self.dict.key(id)
     }
 
-    /// Ends a bulk load: compacts the dictionary and trims tree buffers.
-    pub fn shrink_to_fit(&mut self) {
+    /// Ends a burst of edits cheaply: writes the FSTs' edited states into
+    /// blocks and drops their edit indexes, in time proportional to the
+    /// edits. Records the edits replaced stay until [`Self::shrink_to_fit`].
+    pub fn seal(&mut self) {
+        self.quads.seal();
+    }
+
+    /// Ends a bulk load or a burst of edits: compacts the dictionary and
+    /// repacks each FST, reclaiming the records edits made obsolete.
+    pub fn shrink_to_fit(&mut self)
+    where
+        S: s_graph::storage::ReclaimingBlockStorage,
+    {
         self.dict.shrink_to_fit();
         self.quads.shrink_to_fit();
     }
 
-    /// Logical bytes of the dictionary plus the graph trees.
+    /// Logical bytes of the dictionary plus the graph FSTs.
     pub fn size_bytes(&self) -> usize {
         self.dict.size_bytes() + self.quads.mem_size_bytes()
     }

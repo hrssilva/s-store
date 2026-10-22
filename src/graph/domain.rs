@@ -1,10 +1,11 @@
-//! Coordinate domains for a partition's tree.
+//! Coordinate domains for a partition's FST.
 //!
-//! s-graph fixes a tree's per-dimension domain sizes at construction, and its
+//! s-graph fixes an FST's per-dimension domain sizes at construction, and its
 //! dynamic schedule spends 6 bits (one 64-way level) per trie level across
 //! S, P and O. A total bit width that is not a multiple of 6 leaves a partial
 //! bottom level and, as measured in s-bench (`graph_stage::aligned_sizes`),
-//! can multiply the tree's size several times. So domains here are powers of
+//! can multiply a radix tree's size several times (the FST shares that
+//! level schedule). So domains here are powers of
 //! two whose widths add up to a multiple of 6, padding the predicate
 //! dimension, which is cheap since predicates are few.
 //!

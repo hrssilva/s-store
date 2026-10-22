@@ -5,22 +5,24 @@ edition = "2024"
 license = "MIT"
 description = "An RDF quad store (SPARQL 1.1) with experimental property-graph support, built on s-graph, s-dict and s-parser."
 
-# Sibling working trees, like s-bench's s-dict dependency: the store is
-# developed in lockstep with the three libraries.
+# The sibling libraries, tracked from their master branches (Cargo.lock pins
+# the commit; `cargo update -p s-graph` etc. moves it). To develop against
+# local working trees, override without editing this file, e.g. in
+# .cargo/config.toml: `[patch."https://github.com/hrssilva/s-graph"]
+# s-graph = { path = "../s-graph" }`.
 [dependencies]
-s-graph = { path = "../s-graph" }
-s-dict = { path = "../s-dict" }
-s-parser = { path = "../s-parser" }
+s-graph = { git = "https://github.com/hrssilva/s-graph", branch = "master" }
+s-dict = { git = "https://github.com/hrssilva/s-dict", branch = "master" }
+s-parser = { git = "https://github.com/hrssilva/s-parser", branch = "master" }
 # SPARQL REGEX/REPLACE. The only third-party dependency; compiled patterns
 # are cached per query.
 regex = "1"
 
 [features]
-# s-graph's real-file and LZ4-compressed backends; the store is generic over
-# `s_graph::BlockStorage`, these only make the aliases available.
+# s-graph's real-file and LZ4-compressed FST storage; the store is generic
+# over `s_graph::BlockStorage`, these only make the backends available.
 file = ["s-graph/file"]
 compressed = ["s-graph/compressed"]
-parallel = ["s-graph/parallel"]
 
 [profile.release]
 lto = "thin"

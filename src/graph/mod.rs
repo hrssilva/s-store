@@ -1,15 +1,15 @@
-//! Id-level quad storage: one [`Partition`] (one s-graph tree) per graph.
+//! Id-level quad storage: one [`Partition`] (one s-graph FST) per graph.
 //!
 //! A quad `(g, s, p, o)` is the triple `(s, p', o)` in `g`'s partition,
 //! where `p'` is `p`'s dense predicate id ([`PredicateTable`], shared by all
 //! partitions). Nothing else is stored per quad: no graph column, no
-//! secondary permutations; s-graph's Morton-ordered trie answers every
-//! bound/unbound combination of S, P and O itself.
+//! secondary permutations; s-graph's FST over interleaved S/P/O bits
+//! answers every bound/unbound combination of S, P and O itself.
 //!
-//! Per-graph trees also give SPARQL's dataset model directly: `GRAPH ?g`
+//! Per-graph FSTs also give SPARQL's dataset model directly: `GRAPH ?g`
 //! enumerates partitions, `GRAPH <g>` selects one, and a single-graph BGP is
-//! one native s-graph join. The trade-off is a fixed per-graph cost (one
-//! tree's metadata and first block), which favours datasets with fewer,
+//! one s-graph automaton search. The trade-off is a fixed per-graph cost
+//! (one FST's metadata and first block), which favours datasets with fewer,
 //! larger graphs over one graph per statement.
 //!
 //! This layer knows nothing about terms or queries: [`crate::store`] maps
@@ -19,11 +19,11 @@ pub mod domain;
 pub mod partition;
 pub mod predicates;
 
-pub use partition::{Partition, Tree};
+pub use partition::{Partition, Scan, Tree};
 pub use predicates::PredicateTable;
 
 use s_dict::TermId;
-use s_graph::tree::{ContainsBatchWorkspace, Scan};
+use s_graph::storage::ReclaimingBlockStorage;
 use s_graph::{BlockStorage, Triple};
 use std::collections::BTreeMap;
 use std::collections::btree_map;
@@ -167,10 +167,9 @@ impl<S: BlockStorage> QuadIndex<S> {
     }
 
     /// [`Self::contains`] for each `(s, p, o)` of `quads` in `graph`, into
-    /// `out` in input order; `probes` and `sort` are scratch for the tree
-    /// coordinates and s-graph's sort (reused across calls). One batched
-    /// s-graph descent for all of them.
-    pub fn contains_batch_into(&self, graph: GraphName, quads: &[(TermId, TermId, TermId)], probes: &mut Vec<Triple>, out: &mut Vec<bool>, sort: &mut ContainsBatchWorkspace) {
+    /// `out` in input order; `probes` is scratch for the FST coordinates
+    /// (reused across calls).
+    pub fn contains_batch_into(&self, graph: GraphName, quads: &[(TermId, TermId, TermId)], probes: &mut Vec<Triple>, out: &mut Vec<bool>) {
         let Some(part) = self.partition(graph) else {
             out.clear();
             out.resize(quads.len(), false);
@@ -180,7 +179,7 @@ impl<S: BlockStorage> QuadIndex<S> {
         // An unknown predicate becomes `u32::MAX`, never a dense id, so the
         // probe misses.
         probes.extend(quads.iter().map(|&(s, p, o)| (s.0, self.predicates.get(p).unwrap_or(u32::MAX), o.0)));
-        part.contains_batch_into(probes, out, sort);
+        part.contains_batch_into(probes, out);
     }
 
     /// Drops every quad of `graph`.
@@ -211,12 +210,22 @@ impl<S: BlockStorage> QuadIndex<S> {
         Quads { index: self, default_pending, named, current: None, bounds }
     }
 
-    pub fn shrink_to_fit(&mut self) {
+    /// See [`Partition::seal`].
+    pub fn seal(&mut self) {
+        self.default.seal();
+        self.named.values_mut().for_each(Partition::seal);
+    }
+
+    /// See [`Partition::shrink_to_fit`].
+    pub fn shrink_to_fit(&mut self)
+    where
+        S: ReclaimingBlockStorage,
+    {
         self.default.shrink_to_fit();
         self.named.values_mut().for_each(Partition::shrink_to_fit);
     }
 
-    /// Bytes held by trees and the predicate table.
+    /// Bytes held by the FSTs and the predicate table.
     pub fn mem_size_bytes(&self) -> usize {
         self.predicates.size_bytes() + self.default.mem_size_bytes() + self.named.values().map(Partition::mem_size_bytes).sum::<usize>()
     }
@@ -363,11 +372,11 @@ mod tests {
         let q = sample();
         let quads = [t(3, 51, 4), t(1, 50, 2), t(3, 99, 4), t(5, 50, 6), t(1, 51, 2)];
         let (mut probes, mut out) = (Vec::new(), Vec::new());
-        q.contains_batch_into(G1, &quads, &mut probes, &mut out, &mut ContainsBatchWorkspace::default());
+        q.contains_batch_into(G1, &quads, &mut probes, &mut out);
         assert_eq!(out, vec![true, true, false, false, false]);
-        q.contains_batch_into(GraphName::Default, &quads, &mut probes, &mut out, &mut ContainsBatchWorkspace::default());
+        q.contains_batch_into(GraphName::Default, &quads, &mut probes, &mut out);
         assert_eq!(out, vec![false, true, false, false, false]);
-        q.contains_batch_into(GraphName::Named(TermId(7)), &quads, &mut probes, &mut out, &mut ContainsBatchWorkspace::default());
+        q.contains_batch_into(GraphName::Named(TermId(7)), &quads, &mut probes, &mut out);
         assert_eq!(out, vec![false; 5], "a missing graph holds nothing");
     }
 

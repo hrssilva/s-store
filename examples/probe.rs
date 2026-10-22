@@ -3,7 +3,7 @@ use s_parser::FileStream;
 use s_store::Store;
 use s_store::graph::GraphName;
 use s_store::load::{Format, LoadOptions, load};
-use s_graph::tree::DimRestriction;
+use s_graph::automata::{Bgp, Search, Term};
 use std::ops::ControlFlow;
 use std::time::Instant;
 
@@ -14,7 +14,7 @@ fn main() {
     load(&mut store, source, Format::NTriples, &LoadOptions::default()).expect("load");
     store.shrink_to_fit();
     let tree = store.index().partition(GraphName::Default).unwrap().tree();
-    println!("height {} domains {:?} blocks {}", tree.height(), (0..3).map(|d| tree.domain_size(d)).collect::<Vec<_>>(), tree.block_count());
+    println!("height {} domains {:?} bytes {}", tree.height(), (0..3).map(|d| tree.domain_size(d)).collect::<Vec<_>>(), tree.mem_size_bytes());
     let all: Vec<_> = tree.scan([None; 3]).collect();
     let sample: Vec<_> = (0..20_000).map(|i| all[(i * 7919 * 13) % all.len()]).collect();
     let shapes: [(&str, [bool; 3]); 7] = [("s p ?", [true, true, false]), ("s ? ?", [true, false, false]), ("s ? o", [true, false, true]), ("? p o", [false, true, true]), ("? ? o", [false, false, true]), ("s p o", [true, true, true]), ("? p ?", [false, true, false])];
@@ -35,41 +35,28 @@ fn main() {
     let t = Instant::now();
     let n = tree.scan([None; 3]).count();
     println!("full scan: {:.1} ns/triple ({n})", t.elapsed().as_secs_f64() * 1e9 / n as f64);
-    // restricted_descent (sorted, buffered) and its streaming visit vs scan.
-    let mut buf = Vec::new();
-    let r = |v: [Option<u32>; 3]| v.map(|b| b.map_or(DimRestriction::Free, DimRestriction::Exact));
-    for (name, mask, free) in [("s p ?", [true, true, false], 2usize), ("s ? o", [true, false, true], 1), ("? p o", [false, true, true], 0), ("s ? ?", [true, false, false], 2)] {
+    // Scans vs one-atom automaton searches, compiled once per shape and
+    // run with the bound positions as parameters.
+    for (name, mask) in [("s p ?", [true, true, false]), ("s ? o", [true, false, true]), ("? p o", [false, true, true]), ("s ? ?", [true, false, false])] {
         let bounds = |&(s, p, o): &(u32, u32, u32)| [mask[0].then_some(s), mask[1].then_some(p), mask[2].then_some(o)];
         let n = sample.len().min(5000);
         let t = Instant::now();
         let rows: usize = sample[..n].iter().map(|x| tree.scan(bounds(x)).count()).sum();
         let scan = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        let machine = Bgp::new(3).triple([Term::Var(0), Term::Var(1), Term::Var(2)]);
+        let search = tree.search(&machine).expect("compile");
+        let (mut ws, mut seen) = (Default::default(), 0usize);
         let t = Instant::now();
         for x in &sample[..n] {
-            tree.restricted_descent_into(r(bounds(x)), free, &mut buf);
-        }
-        let into = t.elapsed().as_secs_f64() * 1e6 / n as f64;
-        let t = Instant::now();
-        let mut seen = 0usize;
-        for x in &sample[..n] {
-            let _: ControlFlow<()> = tree.restricted_descent_visit(r(bounds(x)), free, |_| {
+            let b = bounds(x);
+            let values = b.map(|v| v.unwrap_or(0));
+            let bound = [b.iter().enumerate().fold(0u64, |m, (i, v)| m | (u64::from(v.is_some()) << i))];
+            let _: ControlFlow<()> = search.visit_matching(&mut ws, s_graph::automata::Binding { values: &values, bound: &bound }, |_| {
                 seen += 1;
                 ControlFlow::Continue(())
             });
         }
-        let visit = t.elapsed().as_secs_f64() * 1e6 / n as f64;
-        println!("{name}: scan {scan:>8.2} us  descent_into {into:>8.2} us  descent_visit {visit:>8.2} us  ({:.1} rows, {:.1} visited)", rows as f64 / n as f64, seen as f64 / n as f64);
-    }
-    for p in 0..tree.domain_size(1).min(8) as u32 {
-        let t = Instant::now();
-        let mut ends = 0usize;
-        let _: ControlFlow<()> = tree.restricted_descent_visit([DimRestriction::Free, DimRestriction::Exact(p), DimRestriction::Free], 0, |_| {
-            ends += 1;
-            ControlFlow::Continue(())
-        });
-        let a = t.elapsed();
-        let t = Instant::now();
-        let n = tree.scan([None, Some(p), None]).count();
-        println!("subjects of p{p}: descent_visit {a:.2?} ({ends} emitted) vs scan {:.2?} ({n} triples)", t.elapsed());
+        let automaton = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        println!("{name}: scan {scan:>8.2} us  parameterized search {automaton:>8.2} us  ({:.1} rows, {:.1} found)", rows as f64 / n as f64, seen as f64 / n as f64);
     }
 }

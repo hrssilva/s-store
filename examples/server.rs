@@ -1,7 +1,7 @@
 //! A minimal SPARQL endpoint over HTTP, standard library only.
 //!
 //! ```text
-//! cargo run --release --features parallel --example server -- [--bind 127.0.0.1:7878] [--workers N] [FILE[=GRAPH]]...
+//! cargo run --release --example server -- [--bind 127.0.0.1:7878] [--workers N] [FILE[=GRAPH]]...
 //! ```
 //!
 //! Every `FILE` (`.nt` or `.ttl`) is loaded before serving, into the default
@@ -15,6 +15,12 @@
 //!   `application/sparql-results+json`, or as TSV (`format=tsv` or
 //!   `Accept: text/tab-separated-values`); CONSTRUCT/DESCRIBE as N-Triples.
 //! - `POST /load?format=nt|ttl[&graph=IRI][&base=IRI]`: loads the request body.
+//!   Into a non-empty graph, the new triples are edits of its FST, sealed
+//!   into blocks beside it after each upload (milliseconds; see
+//!   `Store::seal`).
+//! - `POST /compact`: repacks every graph's FST, reclaiming the records that
+//!   uploads made obsolete (`Store::shrink_to_fit`; proportional to the
+//!   graph, so run it after a burst of uploads rather than after each).
 //! - `GET /stats`: triple count and memory.
 //!
 //! Queries run concurrently under a read lock; a load takes the write lock.
@@ -166,11 +172,19 @@ fn route(request: &Request, store: &RwLock<Store>) -> Response {
         ("GET", "/") => reply("200 OK", "text/html; charset=utf-8", PAGE),
         ("GET" | "POST", "/sparql") => sparql(request, store),
         ("POST", "/load") => upload(request, store),
+        ("POST", "/compact") => {
+            let mut store = store.write().expect("store lock");
+            let t = Instant::now();
+            store.shrink_to_fit();
+            let elapsed = t.elapsed();
+            eprintln!("compacted in {elapsed:.2?}");
+            reply("200 OK", "application/json", format!("{{\"ms\":{:.3},\"bytes\":{}}}", elapsed.as_secs_f64() * 1e3, store.size_bytes()))
+        }
         ("GET", "/stats") => {
             let store = store.read().expect("store lock");
             reply("200 OK", "application/json", format!("{{\"triples\":{},\"bytes\":{}}}", store.len(), store.size_bytes()))
         }
-        (_, "/" | "/sparql" | "/load" | "/stats") => reply("405 Method Not Allowed", "text/plain", "method not allowed"),
+        (_, "/" | "/sparql" | "/load" | "/compact" | "/stats") => reply("405 Method Not Allowed", "text/plain", "method not allowed"),
         _ => reply("404 Not Found", "text/plain", "not found"),
     }
 }
@@ -250,7 +264,10 @@ fn upload(request: &Request, store: &RwLock<Store>) -> Response {
     let base = request.param("base").filter(|b| !b.is_empty());
     let mut store = store.write().expect("store lock");
     let t = Instant::now();
-    match load_slice(&mut store, &request.body, format, &LoadOptions { graph, base, ..Default::default() }) {
+    let loaded = load_slice(&mut store, &request.body, format, &LoadOptions { graph, base, ..Default::default() });
+    // Even a failed load may have inserted some triples.
+    store.seal();
+    match loaded {
         Ok(stats) => {
             let elapsed = t.elapsed();
             eprintln!("loaded {} triples ({} new) in {elapsed:.2?}", stats.triples, stats.inserted);
@@ -399,7 +416,7 @@ const PAGE: &str = r#"<!doctype html>
     <div class="row">
       <input type="file" id="file" accept=".nt,.ttl">
       <input type="text" id="graph" placeholder="named graph IRI (empty: default graph)" size="36">
-      <button id="load">Load</button><span class="muted" id="loadstatus"></span>
+      <button id="load">Load</button> <button id="compact" title="Repack the graphs' FSTs, reclaiming space uploads left behind">Compact</button><span class="muted" id="loadstatus"></span>
     </div>
   </section>
 </main>
@@ -443,7 +460,15 @@ async function load() {
   $('loadstatus').textContent = `${s.triples.toLocaleString()} triples (${s.inserted.toLocaleString()} new) in ${s.ms.toFixed(0)} ms`;
   stats();
 }
-$('run').onclick = run; $('load').onclick = load;
+async function compact() {
+  $('loadstatus').textContent = 'compacting…';
+  const r = await fetch('/compact', { method: 'POST' });
+  const text = await r.text();
+  if (!r.ok) { $('loadstatus').textContent = 'error: ' + text; return; }
+  $('loadstatus').textContent = `compacted in ${JSON.parse(text).ms.toFixed(0)} ms`;
+  stats();
+}
+$('run').onclick = run; $('load').onclick = load; $('compact').onclick = compact;
 $('query').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) run(); });
 stats();
 </script>

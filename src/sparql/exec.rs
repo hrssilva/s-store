@@ -16,7 +16,7 @@
 use super::locals::LocalTerms;
 use super::path::View;
 use super::idset::IdSet;
-use super::patterns::CheckBuffers;
+use super::patterns::{BgpBuffers, BgpSearch, CheckBuffers};
 use super::plan::*;
 use super::value::Arena;
 use crate::graph::{GraphName, Partition};
@@ -25,7 +25,7 @@ use crate::term::KeyBuf;
 use s_dict::TermId;
 use s_graph::BlockStorage;
 use s_graph::automaton::{AutomatonWorkspace, PathAutomaton};
-use s_graph::native_join::NativeJoinWorkspace;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::rc::Rc;
@@ -44,7 +44,7 @@ pub enum Active {
 }
 
 impl Active {
-    fn cache_key(self) -> u64 {
+    pub(super) fn cache_key(self) -> u64 {
         match self {
             Active::Default => u64::MAX,
             Active::Named(g) => u64::from(g),
@@ -107,7 +107,7 @@ pub struct Env {
     pub keybuf: KeyBuf,
     pub scratch: String,
     pub saved: Vec<u32>,
-    join_workspaces: Vec<NativeJoinWorkspace>,
+    bgp_buffers: Vec<BgpBuffers>,
     check_buffers: Vec<CheckBuffers>,
     id_sets: Vec<IdSet>,
     automaton_workspaces: Vec<AutomatonWorkspace>,
@@ -129,7 +129,7 @@ impl Env {
             keybuf: KeyBuf::new(),
             scratch: String::new(),
             saved: Vec::new(),
-            join_workspaces: Vec::new(),
+            bgp_buffers: Vec::new(),
             check_buffers: Vec::new(),
             id_sets: Vec::new(),
             automaton_workspaces: Vec::new(),
@@ -171,6 +171,9 @@ fn format_now(d: std::time::Duration) -> String {
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z", rem / 3600, rem % 3600 / 60, rem % 60, d.subsec_millis())
 }
 
+/// A compiled BGP's cache key: its pattern range (start, length) and graph.
+pub(super) type SearchKey = (u32, u32, u64);
+
 /// Read-only evaluation context: the store, the plan, the dataset.
 pub struct Ctx<'q, S: BlockStorage> {
     pub store: &'q Store<S>,
@@ -181,6 +184,10 @@ pub struct Ctx<'q, S: BlockStorage> {
     /// The reserved properties graph, reachable only by name
     /// (`GRAPH <urn:x-s-store:properties>`) when no FROM NAMED is given.
     properties: Option<u32>,
+    /// BGPs compiled to s-graph searches, by (pattern range, graph): each
+    /// is compiled once per query and graph, then rerun with each row's
+    /// bindings as parameters.
+    pub(super) searches: RefCell<HashMap<SearchKey, Rc<BgpSearch<'q, S>>>>,
 }
 
 impl<'q, S: BlockStorage> Ctx<'q, S> {
@@ -197,7 +204,7 @@ impl<'q, S: BlockStorage> Ctx<'q, S> {
             (Some(GraphName::Named(g)), None) => Some(g.0),
             _ => None,
         };
-        Ctx { store, plan, default_parts, named, properties }
+        Ctx { store, plan, default_parts, named, properties, searches: RefCell::new(HashMap::new()) }
     }
 
     pub fn view(&self, active: Active) -> View<'_, S> {
@@ -208,6 +215,18 @@ impl<'q, S: BlockStorage> Ctx<'q, S> {
                 many => View::Merged(many),
             },
             Active::Named(g) => self.store.index().partition(GraphName::Named(TermId(g))).map_or(View::Empty, View::One),
+        }
+    }
+
+    /// The active graph when it is exactly one graph, borrowed for the
+    /// query's lifetime (what compiled searches hold).
+    pub(super) fn single(&self, active: Active) -> Option<&'q Partition<S>> {
+        match active {
+            Active::Default => match self.default_parts.as_slice() {
+                [one] => Some(*one),
+                _ => None,
+            },
+            Active::Named(g) => self.store.index().partition(GraphName::Named(TermId(g))),
         }
     }
 
@@ -228,7 +247,7 @@ impl<'q, S: BlockStorage> Ctx<'q, S> {
         match self.plan.node(id) {
             Node::Unit => k(env, row),
             Node::Empty => CONTINUE,
-            Node::Bgp(r) => self.bgp(env, self.plan.triples(r), active, row, k),
+            Node::Bgp(r) => self.bgp(env, r, active, row, k),
             Node::Path { s, path, o } => self.path(env, s, path, o, active, row, k),
             Node::Join(a, b, JoinMode::Bind) => self.eval(env, a, active, row, &mut |env, row| self.eval(env, b, active, row, k)),
             Node::Join(a, b, JoinMode::Materialize { key }) => {
@@ -282,7 +301,7 @@ impl<'q, S: BlockStorage> Ctx<'q, S> {
                     CONTINUE
                 }
             },
-            Node::SetJoin { left, joined, slot, kind } => self.set_join(env, left, self.plan.triples(joined), slot, kind, active, row, k),
+            Node::SetJoin { left, joined, slot, kind } => self.set_join(env, left, joined, slot, kind, active, row, k),
             Node::Check { input, triples, negated } => self.check(env, input, self.plan.triples(triples), negated, active, row, k),
             Node::Filter(e, a) => self.eval(env, a, active, row, &mut |env, row| if self.ebv(env, e, row, active) { k(env, row) } else { CONTINUE }),
             Node::Extend(a, slot, e) => self.eval(env, a, active, row, &mut |env, row| {
@@ -397,12 +416,12 @@ impl<'q, S: BlockStorage> Ctx<'q, S> {
         m
     }
 
-    pub(super) fn join_workspace(env: &mut Env) -> NativeJoinWorkspace {
-        env.join_workspaces.pop().unwrap_or_default()
+    pub(super) fn bgp_buffers(env: &mut Env) -> BgpBuffers {
+        env.bgp_buffers.pop().unwrap_or_default()
     }
 
-    pub(super) fn return_join_workspace(env: &mut Env, ws: NativeJoinWorkspace) {
-        env.join_workspaces.push(ws);
+    pub(super) fn return_bgp_buffers(env: &mut Env, buffers: BgpBuffers) {
+        env.bgp_buffers.push(buffers);
     }
 
     pub(super) fn check_buffers(env: &mut Env) -> CheckBuffers {

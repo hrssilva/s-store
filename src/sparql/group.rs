@@ -113,7 +113,7 @@ impl<S: BlockStorage> Ctx<'_, S> {
             View::Merged(_) => return None,
         };
         let resolved = part.and_then(|part| Some((part, self.pattern_bounds(&shape.triple, row)?)));
-        let count = |part: &Partition<S>, bounds: [Option<u32>; 3]| if bounds == [None; 3] { part.len() } else { part.tree().count_matching(bounds) };
+        let count = |part: &Partition<S>, bounds: [Option<u32>; 3]| part.count_matching(bounds);
         let counts = |n: u64| aggs.iter().map(|_| Acc::Count(n as i64)).collect::<Vec<_>>();
         if !shape.by_predicate {
             let n = resolved.map_or(0, |(part, bounds)| count(part, bounds));

@@ -25,9 +25,9 @@ fn single_pattern_with_constants() {
     assert_eq!(select(&st, "SELECT ?s WHERE { ?s ex:knows ex:nobody }"), rows(&[]));
 }
 
-/// A pattern with one free position, after substitution, streams that
-/// position alone from s-graph; every position, a dense predicate and an
-/// early stop must still come out right.
+/// A pattern with one free position, after substitution, is an automaton
+/// search with the bound positions as parameters; every position, a dense
+/// predicate and an early stop must still come out right.
 #[test]
 fn patterns_with_one_free_position() {
     let st = people();
@@ -68,6 +68,31 @@ fn variable_predicates_join_with_other_positions() {
     assert_eq!(
         select(&st, "SELECT ?p WHERE { ex:a ?p ?o }"),
         rows(&[&["<http://ex/label>"], &["<http://ex/p>"]])
+    );
+}
+
+/// A BGP joined per left solution is compiled once and rerun with each
+/// row's bindings as parameters: predicate variables (dense ids), variables
+/// bound to terms that cannot occur (unknown predicates, query-computed
+/// terms) and variables in two positions must behave as substitution would.
+#[test]
+fn bgps_rerun_with_row_bindings_as_parameters() {
+    let st = store_with("ex:p ex:label \"P\" . ex:a ex:p ex:b . ex:b ex:p ex:c . ex:a ex:label \"A\" . ex:c ex:q ex:q .");
+    // ?p bound per row (VALUES forces a join), used as a predicate.
+    assert_eq!(
+        select(&st, "SELECT ?p ?o WHERE { VALUES ?p { ex:p ex:label ex:nope } ex:a ?p ?o }"),
+        rows(&[&["<http://ex/label>", "\"A\""], &["<http://ex/p>", "<http://ex/b>"]])
+    );
+    // Bound to a string BIND computed: no stored term matches it.
+    assert_eq!(select(&st, "SELECT ?s WHERE { BIND(CONCAT(\"A\", \"\") AS ?l) ?s ex:label ?l }"), rows(&[&["<http://ex/a>"]]));
+    assert_eq!(select(&st, "SELECT ?s WHERE { BIND(CONCAT(\"x\", \"y\") AS ?l) ?s ex:label ?l }"), rows(&[]));
+    // One variable as predicate and object, bound or free.
+    assert_eq!(select(&st, "SELECT ?x WHERE { ?s ?x ?x }"), rows(&[&["<http://ex/q>"]]));
+    assert_eq!(select(&st, "SELECT ?s WHERE { VALUES ?x { ex:q ex:p } ?s ?x ?x }"), rows(&[&["<http://ex/c>"]]));
+    // A two-pattern BGP rerun for many rows, each with a different binding.
+    assert_eq!(
+        select(&st, "SELECT ?x ?z WHERE { VALUES ?x { ex:a ex:b ex:c } ?x ex:p ?y . ?y ex:p ?z }"),
+        rows(&[&["<http://ex/a>", "<http://ex/c>"]])
     );
 }
 

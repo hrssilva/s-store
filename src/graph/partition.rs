@@ -1,21 +1,34 @@
-//! One graph's triples: an s-graph tree whose domains grow on demand.
+//! One graph's triples: an editable s-graph FST whose domains grow on
+//! demand.
 //!
 //! Coordinates are `(subject term id, dense predicate id, object term id)`.
-//! s-graph cannot widen a built tree's domains, so an insert outside them
-//! rebuilds the tree, streaming the old tree's own [`Tree::scan`] into a
-//! bounded bulk build: no intermediate triple list is materialized beyond
-//! s-graph's own bounded build buffers, and [`Domains::grown`] at least
-//! doubles the subject/object domain, so rebuild cost is amortized O(1) per
-//! insert.
+//! The graph is s-graph's [`EditableFst`]: a packed, suffix-sharing FST
+//! (identical suffix languages share one state) with local, minimality
+//! preserving insertion and removal over it. A bulk load builds the packed
+//! FST once; edits go to s-graph's in-memory edit arena. [`Partition::seal`]
+//! writes the edited states into blocks next to the packed ones (cheap,
+//! proportional to the edits); [`Partition::shrink_to_fit`] repacks
+//! everything, reclaiming the records the edits made obsolete.
+//!
+//! An FST's domains are fixed when it is built, so an insert outside them
+//! rebuilds it from its own triples with grown domains; [`Domains::grown`]
+//! at least doubles the subject/object domain, so rebuild cost is amortized
+//! O(1) per insert.
 
 use super::domain::Domains;
-use s_graph::tree::{ContainsBatchWorkspace, RadixTreeDfsInterleavedVarSkipUnrolledGeneric, Scan};
-use s_graph::{BlockStorage, BulkBuildBudget, Triple};
+use s_graph::automata::MutableFstSource;
+use s_graph::path_ops::PatternIter;
+use s_graph::mutable_fst::UpdateLookup;
+use s_graph::storage::ReclaimingBlockStorage;
+use s_graph::{BlockStorage, EditableFst, PackedFst, Triple};
 
-pub type Tree<S> = RadixTreeDfsInterleavedVarSkipUnrolledGeneric<S>;
+pub type Tree<S> = EditableFst<S>;
 
-/// Resident points during a rebuild before s-graph spills to disk.
-const REBUILD_BUDGET: BulkBuildBudget = BulkBuildBudget { max_resident_points: 1 << 24, io_buffer_bytes: BulkBuildBudget::DEFAULT_IO_BUFFER_BYTES };
+/// How s-graph finds an edited state's existing twin to re-share suffixes.
+const LOOKUP: UpdateLookup = UpdateLookup::Sampled(8);
+
+/// Matching triples of a [`Partition`], decoded straight from the FST.
+pub type Scan<'a, S> = PatternIter<'a, MutableFstSource<'a, S>>;
 
 pub struct Partition<S: BlockStorage> {
     tree: Tree<S>,
@@ -25,24 +38,28 @@ pub struct Partition<S: BlockStorage> {
     max_predicate: u32,
     len: u64,
     block_capacity: usize,
+    /// Edits were sealed into blocks since the last repack, leaving
+    /// obsolete records behind.
+    sealed: bool,
 }
 
 impl<S: BlockStorage> Partition<S> {
     pub fn new(block_capacity: usize) -> Self {
-        let domains = Domains::fitting(0, 0);
-        Self { tree: Tree::build_dynamic_empty(domains.sizes(), block_capacity), domains, max_predicate: 0, len: 0, block_capacity }
+        Self::build(Vec::new(), Domains::fitting(0, 0), 0, block_capacity)
     }
 
-    /// Bulk-builds from `triples` (duplicates allowed). Sorts and
-    /// deduplicates in place to know the exact count.
-    pub fn from_triples(mut triples: Vec<Triple>, block_capacity: usize) -> Self {
-        triples.sort_unstable();
-        triples.dedup();
+    /// Bulk-builds from `triples` (duplicates allowed; s-graph sorts and
+    /// deduplicates them as it builds).
+    pub fn from_triples(triples: Vec<Triple>, block_capacity: usize) -> Self {
         let (max_term, max_predicate) = triples.iter().fold((0, 0), |(t, p), &(s, pp, o)| (t.max(s).max(o), p.max(pp)));
-        let domains = Domains::fitting(max_term, max_predicate);
-        let len = triples.len() as u64;
-        let tree = Tree::build_dynamic_bounded(triples.into_iter(), domains.sizes(), block_capacity, REBUILD_BUDGET);
-        Self { tree, domains, max_predicate, len, block_capacity }
+        Self::build(triples, Domains::fitting(max_term, max_predicate), max_predicate, block_capacity)
+    }
+
+    fn build(triples: Vec<Triple>, domains: Domains, max_predicate: u32, block_capacity: usize) -> Self {
+        let tree = PackedFst::try_build(triples, domains.sizes(), block_capacity).expect("domains hold every triple").into_mutable_with_lookup(LOOKUP);
+        // Counted over the FST's shared states, without listing triples.
+        let len = tree.count_matching([None; 3]);
+        Self { tree, domains, max_predicate, len, block_capacity, sealed: false }
     }
 
     /// Reassembles a partition from a deserialized tree, its stored count
@@ -50,7 +67,7 @@ impl<S: BlockStorage> Partition<S> {
     pub fn from_tree(tree: Tree<S>, len: u64, max_predicate: u32, block_capacity: usize) -> Self {
         let term_bits = tree.domain_size(0).trailing_zeros();
         let predicate_bits = tree.domain_size(1).trailing_zeros();
-        Self { tree, domains: Domains { term_bits, predicate_bits }, max_predicate, len, block_capacity }
+        Self { tree, domains: Domains { term_bits, predicate_bits }, max_predicate, len, block_capacity, sealed: false }
     }
 
     pub fn len(&self) -> u64 {
@@ -73,21 +90,31 @@ impl<S: BlockStorage> Partition<S> {
         &self.tree
     }
 
+    /// The FST as an automata source: what [`s_graph::automata`] searches
+    /// compile against.
+    pub fn source(&self) -> MutableFstSource<'_, S> {
+        self.tree.source()
+    }
+
     pub fn contains(&self, s: u32, p: u32, o: u32) -> bool {
         self.tree.contains(s, p, o)
     }
 
     /// [`Self::contains`] for every triple of `triples`, into `out` in input
-    /// order. s-graph sorts the probes (in `sort`, reused across calls) and
-    /// shares descents between them, so this is far cheaper than one
-    /// `contains` per triple.
-    pub fn contains_batch_into(&self, triples: &[Triple], out: &mut Vec<bool>, sort: &mut ContainsBatchWorkspace) {
-        self.tree.contains_batch_into(triples, out, sort);
+    /// order.
+    pub fn contains_batch_into(&self, triples: &[Triple], out: &mut Vec<bool>) {
+        self.tree.contains_batch_into(triples, out);
     }
 
-    /// Matching triples in the tree's Morton order; `None` is a wildcard.
+    /// Matching triples; `None` is a wildcard.
     pub fn scan(&self, bounds: [Option<u32>; 3]) -> Scan<'_, S> {
         self.tree.scan(bounds)
+    }
+
+    /// Matching triples, counted over shared FST states without decoding
+    /// them.
+    pub fn count_matching(&self, bounds: [Option<u32>; 3]) -> u64 {
+        if bounds == [None; 3] { self.len } else { self.tree.count_matching(bounds) }
     }
 
     pub fn insert(&mut self, s: u32, p: u32, o: u32) -> bool {
@@ -114,8 +141,34 @@ impl<S: BlockStorage> Partition<S> {
         removed
     }
 
-    pub fn shrink_to_fit(&mut self) {
-        self.tree.shrink_to_fit();
+    /// Ends a burst of edits: s-graph writes the live edited states into
+    /// blocks beside the packed FST and drops the edit arena and indexes.
+    /// Costs time proportional to the edits, not the graph; the records
+    /// the edits replaced stay until [`Self::shrink_to_fit`].
+    pub fn seal(&mut self) {
+        if self.tree.edited_node_count() > 0 {
+            self.replace_tree(|tree| tree.freeze_in_place().map(|frozen| frozen.into_mutable_with_lookup(LOOKUP)));
+            self.sealed = true;
+        }
+    }
+
+    /// Repacks the FST, edits and sealed records included, into ordinary
+    /// packed blocks, releasing source blocks as they are copied.
+    pub fn shrink_to_fit(&mut self)
+    where
+        S: ReclaimingBlockStorage,
+    {
+        if self.sealed || self.tree.edited_node_count() > 0 {
+            self.replace_tree(|tree| tree.freeze().map(|packed| packed.into_mutable_with_lookup(LOOKUP)));
+            self.sealed = false;
+        }
+    }
+
+    /// s-graph's freezes consume the FST; an empty one stands in meanwhile.
+    fn replace_tree(&mut self, f: impl FnOnce(Tree<S>) -> s_graph::Result<Tree<S>>) {
+        let empty = Tree::try_build(Vec::new(), self.domains.sizes(), self.block_capacity).expect("empty FST");
+        let tree = std::mem::replace(&mut self.tree, empty);
+        self.tree = f(tree).expect("freezing a valid FST");
     }
 
     pub fn mem_size_bytes(&self) -> usize {
@@ -128,9 +181,8 @@ impl<S: BlockStorage> Partition<S> {
             return;
         }
         let domains = self.domains.grown(max_term, self.max_predicate);
-        let rebuilt = Tree::build_dynamic_bounded(self.tree.scan([None; 3]), domains.sizes(), self.block_capacity, REBUILD_BUDGET);
-        self.tree = rebuilt;
-        self.domains = domains;
+        let triples: Vec<Triple> = self.tree.scan([None; 3]).collect();
+        *self = Self::build(triples, domains, self.max_predicate, self.block_capacity);
     }
 }
 
@@ -139,6 +191,7 @@ mod file_backend_tests {
     #[test]
     fn grows_on_file_storage() {
         let mut p = super::Partition::<s_graph::storage_file::FileStorage>::new(4096);
+        assert!(p.insert(1, 0, 2));
         assert!(p.insert(1, 0, 70_000));
         assert!(p.contains(1, 0, 70_000));
     }
@@ -177,10 +230,31 @@ mod tests {
         let p = P::from_triples(vec![(1, 0, 2), (2, 1, 1), (7, 0, 3)], 4096);
         let probes = [(7, 0, 3), (1, 0, 3), (1, 0, 2), (1, 0, 2), (u32::MAX, 0, 2), (2, u32::MAX, 1)];
         let mut out = vec![true; 10];
-        p.contains_batch_into(&probes, &mut out, &mut ContainsBatchWorkspace::default());
+        p.contains_batch_into(&probes, &mut out);
         assert_eq!(out, vec![true, false, true, true, false, false], "duplicates repeat, out-of-domain is absent");
-        p.contains_batch_into(&[], &mut out, &mut ContainsBatchWorkspace::default());
+        p.contains_batch_into(&[], &mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn counts_and_compacts_edits() {
+        let mut p = P::from_triples(vec![(1, 0, 2), (1, 0, 3), (2, 1, 3)], 4096);
+        assert_eq!(p.count_matching([Some(1), None, None]), 2);
+        assert_eq!(p.count_matching([None; 3]), 3);
+        assert!(p.insert(4, 1, 3));
+        assert!(p.remove(1, 0, 2));
+        p.seal();
+        assert_eq!(p.tree().edited_node_count(), 0);
+        assert_eq!(all(&p), vec![(1, 0, 3), (2, 1, 3), (4, 1, 3)]);
+        // Edits resume over the sealed records.
+        assert!(p.insert(5, 0, 2));
+        assert!(p.remove(4, 1, 3));
+        p.seal();
+        assert_eq!(all(&p), vec![(1, 0, 3), (2, 1, 3), (5, 0, 2)]);
+        p.shrink_to_fit();
+        assert_eq!(all(&p), vec![(1, 0, 3), (2, 1, 3), (5, 0, 2)]);
+        assert_eq!(p.count_matching([None, Some(1), Some(3)]), 1);
+        assert_eq!(p.len(), 3);
     }
 
     #[test]

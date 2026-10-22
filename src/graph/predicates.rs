@@ -1,13 +1,13 @@
 //! Dense predicate ids.
 //!
 //! In the dictionary's id space a predicate coordinate would span every term
-//! id, widening the tree's predicate dimension to the subject/object width.
+//! id, widening the FST's predicate dimension to the subject/object width.
 //! Predicates are few, so they get a dense id space of their own (as in
 //! s-bench's graph stage): a `Vec` from dense id to term, and a sorted
 //! `Vec` from term to dense id. Both are a handful of bytes per distinct
 //! predicate; no hashing structure is kept.
 //!
-//! A dense id is never reused, so trees and query plans can hold one without
+//! A dense id is never reused, so FSTs and query plans can hold one without
 //! tracking predicate removal.
 
 use s_dict::TermId;

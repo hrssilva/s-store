@@ -3,8 +3,9 @@
 //! - [`s_dict`] interns every RDF term as a `u32` [`TermId`]; the dictionary
 //!   key is the term's canonical N-Triples serialization ([`term`]).
 //! - [`s_graph`] indexes `(subject, predicate, object)` id triples. The store
-//!   keeps one tree per graph (the default graph and each named graph), so a
-//!   quad costs exactly what its triple costs in one tree ([`graph`]).
+//!   keeps one FST per graph (the default graph and each named graph), so a
+//!   quad costs exactly what its triple costs in one FST ([`graph`]), and
+//!   runs BGPs as s-graph automata over it ([`sparql`]).
 //! - [`s_parser`] feeds data (N-Triples, Turtle) and SPARQL queries; terms are
 //!   encoded straight from the parser's borrowed spans ([`load`], [`sparql`]).
 //!

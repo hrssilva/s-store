@@ -1,4 +1,4 @@
-//! Bulk ingestion: parser records to dictionary batches to graph trees.
+//! Bulk ingestion: parser records to dictionary batches to graph FSTs.
 //!
 //! The pipeline mirrors s-bench's `nt_dict_file_bench ... graph`:
 //!
@@ -10,9 +10,9 @@
 //!    (sorted and grouped) and interned in one `insert_prepared` call per
 //!    batch. The batch's buffers are reused across batches.
 //! 3. The returned ids become `(s, p, o)` triples. Loading into an empty
-//!    graph collects them (12 bytes per triple) and bulk-builds the graph's
-//!    tree once at the end; loading into a non-empty graph inserts each
-//!    batch with s-graph's Morton-sorted `insert_batch`.
+//!    graph collects them (12 bytes per triple) and builds the graph's
+//!    packed FST once at the end; loading into a non-empty graph inserts
+//!    each batch as FST edits (`insert_batch`).
 //! 4. A load into a store whose dictionary was empty (so it issued every id
 //!    in the store) renumbers the dictionary to term order before the bulk
 //!    build, remapping the collected triples and the graph name: every id
@@ -466,7 +466,7 @@ struct Batcher<'s, S: BlockStorage> {
     pending: usize,
     /// Id triples not yet in the graph (all of them, in bulk mode).
     triples: Vec<Triple>,
-    /// The target graph was empty: build its tree once at the end.
+    /// The target graph was empty: build its FST once at the end.
     bulk: bool,
     /// In bulk mode, renumber the dictionary to term order before the
     /// build: set only when this load issued every id in the store.

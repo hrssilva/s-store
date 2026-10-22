@@ -11,14 +11,14 @@ intermediate solution sets where the algebra doesn't demand one.
 |---|---|---|
 | `term` | canonical term keys; relative IRI resolution | s-parser term types |
 | `dict` | key ↔ `u32` id (`Dictionary`, `Terms` trait) | s-dict |
-| `graph` | id-level quads: one `Partition` (s-graph tree) per graph | s-graph |
+| `graph` | id-level quads: one `Partition` (s-graph FST) per graph | s-graph |
 | `store` | `Store` = `Dictionary` + `QuadIndex`, key-level API | dict, graph |
 | `load` | batched ingestion (N-Triples, Turtle) | s-parser, s-dict batches |
 | `property` | experimental property graph over a reserved graph | store |
 | `sparql` | compile + evaluate SPARQL 1.1 queries | all of the above |
 
 The query engine depends on narrow interfaces (`Terms`, partitions'
-`scan`/tree, `PatternBackend`), so a Cypher front end can reuse `exec`'s
+`scan`/`source`, `PatternBackend`), so a Cypher front end can reuse `exec`'s
 operators and `patterns`' s-graph delegation with its own compiler.
 
 ## Terms: the dictionary key is canonical N-Triples
@@ -37,24 +37,46 @@ base. Consequences:
 - Blank nodes are scoped per load: `_:b{scope}_{label}` (written labels),
   `_:b{scope}-{n}` (parser-generated). Injective, and still valid N-Triples.
 
-## Graph storage: one s-graph tree per graph
+## Graph storage: one s-graph FST per graph
 
-A quad `(g, s, p, o)` is the triple `(s, p', o)` in graph `g`'s tree.
+A quad `(g, s, p, o)` is the triple `(s, p', o)` in graph `g`'s FST.
 
+- **The FST** is s-graph's `EditableFst` (`MutableFst<S>`): the K³ radix
+  trie over interleaved S/P/O bits with identical suffix languages shared
+  as one state, packed into blocks. Against the radix tree it replaced, the
+  whole store (dictionary included) shrank from 110 to 48 MB on small.nt
+  (4.9M triples) and from 486 to 158 MB on data.nt (19.7M triples).
 - **S/O coordinates are dictionary ids** — no remap tables (s-bench's
   `DictSlack` layout). **Predicates** get a dense id space (`PredicateTable`:
   12 bytes per distinct predicate), otherwise the predicate dimension would
   be as wide as the term space.
 - **Domains** are powers of two with total bit width a multiple of 6 (whole
-  64-way trie levels; padding goes to the predicate dimension). s-bench
-  measured up to 3.6× tree size for misaligned widths.
-- **Growth**: s-graph can't widen a built tree, so an out-of-domain insert
-  rebuilds by streaming the old tree's own `scan()` into
-  `build_dynamic_bounded` (bounded memory, spills to disk). Domains at least
-  double → amortized O(1) per insert.
+  64-way levels; padding goes to the predicate dimension). s-bench
+  measured up to 3.6× radix-tree size for misaligned widths; the FST uses
+  the same level schedule.
+- **Growth**: an FST's domains are fixed at build, so an out-of-domain
+  insert rebuilds it from its own `scan()` (12 B per triple while it
+  rebuilds). Domains at least double → amortized O(1) per insert.
 - **Bulk load into an empty graph** collects id triples (12 B each) and
-  bulk-builds once; loads into non-empty graphs use Morton-sorted
-  `insert_batch` per dictionary batch.
+  builds the packed FST once (s-graph sorts, deduplicates and shares
+  suffixes; the count comes from `count_matching` over shared states).
+  Loads into non-empty graphs, and single inserts and removes, are FST
+  edits: s-graph copies the touched path into an in-memory edit arena and
+  re-shares suffixes, keeping the language minimal. The first edit after a
+  build or seal builds s-graph's suffix index over the packed states; the
+  store uses `UpdateLookup::Sampled(8)` (every packed address, every 8th
+  prefix). small.nt: ~150 ms fixed index cost, 10k triples in ~200 ms with
+  a 52 MB peak (`Sampled(1)`: same speed, 59 MB; `Memoized`: 40-48 MB but
+  ~8 ms per inserted triple, 80 s per 10k batch). `Store::seal` (s-graph's
+  `freeze_in_place`) writes the live edited states into blocks beside the
+  packed ones and drops the arena and indexes: 4 ms, back to 41 MB, and
+  edits resume over the sealed records. The server seals after every
+  upload. The records edits replaced stay allocated (about +2 MB per 10k
+  triples) until `Store::shrink_to_fit` (s-graph's consuming, streaming
+  `freeze`) repacks the whole FST: 155 ms on small.nt after 50k inserted
+  triples, against 2.05 s for the borrowing `compact(&mut)` it replaced.
+  Queries run at the same speed sealed, packed or with edits pending.
+  Repacking needs s-graph's `ReclaimingBlockStorage` (all three backends).
 - **Term-order ids after a fresh load**: when the dictionary was empty
   before a load (so nothing else holds an id: graph names, predicate
   table, other partitions), the loader renumbers it to term order
@@ -88,14 +110,15 @@ A quad `(g, s, p, o)` is the triple `(s, p', o)` in graph `g`'s tree.
   partition the keys in order, into one dictionary with term-rank ids
   without decoding a term, and the triples are remapped per worker in
   parallel. The result is the term-order dictionary a sequential load
-  renumbers to, with the same ids. Building with `--features parallel`
-  also makes s-graph's bulk build use rayon (2.2 -> 0.95 s on small.nt,
-  identical tree). small.nt with 12 workers: 9.6 s -> 2.7 s (sample 0.04 s,
-  parse + intern 1.75 s, join + remap 0.06 s, build 0.9 s); data.nt (19.7M
-  triples): 92 s with one worker -> 18.3 s (intern 14 s, which grows
-  faster than the data, as with one writer: inserts get dearer as blocks
-  fill). 6 or 8 writers are within noise of 12; 4 add ~20%.
-- **Trade-off**: fixed cost per graph (tree metadata + first block). Fine for
+  renumbers to, with the same ids. With the radix tree (whose bulk build
+  had a rayon mode): small.nt with 12 workers 9.6 s -> 2.7 s (sample
+  0.04 s, parse + intern 1.75 s, join + remap 0.06 s, build 0.9 s);
+  data.nt (19.7M triples): 92 s with one worker -> 18.3 s (intern 14 s,
+  which grows faster than the data, as with one writer: inserts get dearer
+  as blocks fill). 6 or 8 writers are within noise of 12; 4 add ~20%.
+  s-graph's FST build is single-threaded, so the same loads now take 6.9 s
+  and 40.4 s.
+- **Trade-off**: fixed cost per graph (FST metadata + first block). Fine for
   datasets with a moderate number of graphs; "one graph per statement" data
   would want a different partitioning (e.g. graph id folded into a dimension).
 - Terms are never removed from the dictionary when quads are deleted
@@ -126,11 +149,24 @@ unbinds. `ControlFlow` lets LIMIT/ASK/EXISTS stop everything, including
 s-graph's traversals.
 
 **Delegation to s-graph** (`sparql::patterns`):
-- A BGP over one graph → one `NativeJoin` (all patterns traversed jointly over
-  the S/P/O trie, bindings streamed). Outer bindings are substituted as
-  constants. A variable used both as predicate and subject/object becomes two
-  join variables (dense vs dictionary id space) checked equal on output.
-- A single pattern → one bounded `scan`.
+- A BGP over one graph (a single pattern included) → one s-graph automaton
+  (`automata::Bgp`, compiled with `graph.search`): every pattern is an atom
+  of one register automaton traversing the FST, bindings streamed. It is
+  compiled once per query and graph (cached by pattern range in `Ctx`), with
+  every variable left a variable; each evaluation passes the row's bound
+  slots as parameters (`Search::visit_matching`), which s-graph pushes into
+  the traversal as bit constraints. So a BGP joined per left solution is
+  never recompiled, unlike the per-row `NativeJoin` it replaces. A variable
+  used both as predicate and subject/object becomes two automaton variables
+  (dense vs dictionary id space) checked equal on output; a row value with
+  no dense predicate id, or a query-local id, matches nothing.
+- **Schedule**: BGP automata use `Schedule::Levels` (every atom advances one
+  FST level at a time, synchronized on shared variable bits, as the native
+  join did). s-graph's default `Adaptive` chose a nested schedule on every
+  workload shape (small.nt): star `?s a C ; label ?v` 369 ms vs 12.6 ms,
+  `?s link ?a ; label ?b` 172 vs 45 ms, `?a ?p ?b . ?b a ?c` 2.75 s vs
+  167 ms; only the chain `?a link ?b . ?b a C` was faster nested (38 vs
+  88 ms). `Frontier` was slowest everywhere (up to 22 s).
 - A BGP over a merged default graph (`FROM` several graphs) → pattern-at-a-time
   joins over merged scans (most-bound first); merged scans skip triples an
   earlier graph produced (RDF merge = set).
@@ -153,9 +189,10 @@ by the left side is only point lookups once a left solution is substituted.
 The compiler rewrites it to `Check`; the executor buffers left solutions
 (4096 at a time, buffers pooled per query), probes all their patterns with
 one s-graph `contains_batch` per graph, and passes the survivors on in their
-original order. s-graph sorts the probes and shares descents, which matters
-because one `contains` re-descends from the root, skipping siblings one by
-one (µs per lookup on large trees). Measured ~10× over per-row evaluation.
+original order. With the radix tree, s-graph sorted the probes and shared
+descents (~10× over per-row evaluation); the FST answers each probe with an
+independent descent, but word-at-a-time, so the batched queries kept their
+speed (X1/X2 on small.nt: ~41 ms either way).
 Scans of a merged default graph check later graphs' triples against the
 earlier graphs the same way, in batches after the first 64 triples (short
 scans stay allocation-free). `QuadIndex::contains_batch_into` and
@@ -165,7 +202,7 @@ scans stay allocation-free). `QuadIndex::contains_batch_into` and
 FILTER EXISTS / NOT EXISTS and MINUS between two BGPs that share exactly one
 variable, certainly bound by both, decide each left solution by that one
 value. The compiler concatenates both BGPs; the executor runs them as one
-native s-graph join, records the shared variable's values in an id set
+s-graph automaton, records the shared variable's values in an id set
 (`sparql::idset`: one bit per dictionary id, zero pages until written,
 cleared by touched words, pooled per query), passes the joined solutions on
 for an OPTIONAL, then evaluates the left BGP once more and keeps, drops or
@@ -182,19 +219,22 @@ repeated variable) whose aggregates are all `COUNT(*)`, `COUNT(DISTINCT *)`
 or `COUNT(?v)` of a pattern variable, grouped by nothing or by the pattern's
 predicate variable, produces no solutions: an all-variable pattern is the
 graph's size, any other is s-graph's `count_matching` (leaf words counted by
-popcount), and GROUP BY ?p counts once per dense predicate, skipping zero
-counts. A merged default graph (shared triples would count twice) or an
+popcount, memoized per shared FST state), and GROUP BY ?p counts once per
+dense predicate, skipping zero counts. A merged default graph (shared triples would count twice) or an
 already-bound grouping predicate falls back to ordinary grouping. On the
 500k-subject synthetic file: COUNT of everything 318 ms → 0.01 ms, of one
 class 18.5 → 0.75 ms, of the busiest predicate 195 → 68 ms, the predicate
 histogram 352 → 234 ms (one traversal per predicate; a single traversal
-counting all predicates at once would need s-graph support).
+counting all predicates at once would need s-graph support). On the FST,
+`count_matching` memoizes every state in a `HashMap`, which costs more than
+the sharing saves here: small.nt's predicate histogram 146 → 591 ms, one
+predicate 8 → 28 ms, one class 0.55 → 1.7 ms.
 
 **Paths with both ends free** (`?x p* ?y`): only nodes with an edge
 matching one of the automaton's start transitions can take a step, so walks
-start from those alone, collected into an id set by s-graph's projection
-`query_one_bound_into` (distinct subjects or objects of a predicate, deduped
-in the descent). When the path matches zero-length paths, one scan per graph
+start from those alone, collected into an id set from a predicate-bounded
+FST scan per start transition (the radix tree's projection,
+`restricted_descent_visit`, has no FST counterpart for editable graphs). When the path matches zero-length paths, one scan per graph
 puts every subject and object in a second id set, and each node that is not a
 start pairs with itself only. Nodes come out in id order. The benchmark's
 `subClassOf*` closure on the 500k-subject file went from 49 s (a walk, with
@@ -215,10 +255,9 @@ per-row key allocation.
 
 ## Known gaps and upstream issues
 
-- **s-parser, fixed in its working tree (uncommitted)**: nested function call
-  argument lists were interleaved in the expression-list pool
-  (`CONCAT("[", STR(?x), "]")` parsed as four arguments). Regression test
-  added in `s-parser/tests/sparql.rs`.
+- **s-parser, fixed upstream**: nested function call argument lists were
+  interleaved in the expression-list pool (`CONCAT("[", STR(?x), "]")`
+  parsed as four arguments). Regression test in `s-parser/tests/sparql.rs`.
 - **s-parser, worked around here**: `Slice` is nested inside
   `Project`/`Distinct`, so `DISTINCT … LIMIT` would limit before dedup; the
   compiler reorders it.
@@ -228,6 +267,12 @@ per-row key allocation.
 - Decimals are `f64` (no arbitrary precision); MD5/SHA*, SPARQL Update,
   SERVICE, RDF/XML and JSON-LD are not implemented; DESCRIBE returns the
   resource's outgoing triples (no blank-node closure).
+- **s-graph, measured here**: the `Adaptive` schedule picks nested
+  traversal where `Levels` is 3-30× faster (see Schedule above); FST
+  `count_matching` is 3-4× slower than the radix tree's (HashMap memo);
+  `MutableFst` has no projection (`select`/`restricted_descent_visit`), so
+  "distinct subjects of a predicate" is a scan; the FST build is
+  single-threaded (loads 2.5× slower than the tree's rayon build).
 - MINUS outside the set-join and check cases still materializes its right
   side without a key, so it compares every left row with every right row.
 - Aggregates skip unbound inputs (Jena/RDF4J behaviour); bound values of the
