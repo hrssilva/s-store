@@ -48,14 +48,20 @@ pub struct CheckBuffers {
     current: Vec<u32>,
 }
 
-/// The traversal schedule of BGP automata: every atom advances one FST
-/// level at a time, synchronized on shared variable bits (what s-graph's
-/// native join did). s-graph's default, `Adaptive`, chose a nested
-/// schedule on every workload shape measured (4.9M triples): a star join
-/// took 369 ms instead of 12.6 ms, `?a ?p ?b . ?b a ?c` 2.75 s instead of
-/// 167 ms; only a chain into a constant type was faster nested (38 vs
-/// 88 ms). See DESIGN.md.
-const SCHEDULE: Schedule = Schedule::Levels;
+/// The traversal schedule of a BGP automaton with `atoms` triple patterns.
+/// No s-graph schedule is safe on every shape (4.9M triples, s-graph
+/// 4833f68). Up to three atoms, `Levels` (all atoms advance one FST level
+/// at a time) is the fastest or close to it: a 2-atom star 16 ms against
+/// 800 ms under `Adaptive`, `?a ?p ?b . ?b a ?c` 0.2 s against 6 s, 3-atom
+/// stars and chains 0.2-0.5 s against 1.4-4.4 s nested; `Adaptive` took
+/// over 100 s on `?a link ?b . ?b link ?c . ?c a C`. From four atoms on
+/// `Levels` blows up (a 4-atom chain 14-23 s, a 4-atom star or 5-atom
+/// chain over 100 s), while `Adaptive` and its connected orders matched or
+/// beat `Nested` on every shape measured (0.7-7 s, chains up to 10 atoms).
+/// See DESIGN.md.
+fn schedule(atoms: usize) -> Schedule {
+    if atoms <= 3 { Schedule::Levels } else { Schedule::Adaptive }
+}
 
 /// A BGP compiled for one graph: an s-graph search and its variables.
 pub struct BgpSearch<'q, S: BlockStorage> {
@@ -175,7 +181,8 @@ impl<'q, S: BlockStorage> Ctx<'q, S> {
             }
             patterns.push(terms);
         }
-        let machine = patterns.into_iter().fold(automata::Bgp::new(vars.len()), automata::Bgp::triple).schedule(SCHEDULE);
+        let atoms = patterns.len();
+        let machine = patterns.into_iter().fold(automata::Bgp::new(vars.len()), automata::Bgp::triple).schedule(schedule(atoms));
         let search = part.tree().search(&machine).expect("a well-formed BGP over valid domains");
         BgpSearch { search: Some(search), vars }
     }

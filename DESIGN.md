@@ -160,13 +160,28 @@ s-graph's traversals.
   used both as predicate and subject/object becomes two automaton variables
   (dense vs dictionary id space) checked equal on output; a row value with
   no dense predicate id, or a query-local id, matches nothing.
-- **Schedule**: BGP automata use `Schedule::Levels` (every atom advances one
-  FST level at a time, synchronized on shared variable bits, as the native
-  join did). s-graph's default `Adaptive` chose a nested schedule on every
-  workload shape (small.nt): star `?s a C ; label ?v` 369 ms vs 12.6 ms,
-  `?s link ?a ; label ?b` 172 vs 45 ms, `?a ?p ?b . ?b a ?c` 2.75 s vs
-  167 ms; only the chain `?a link ?b . ?b a C` was faster nested (38 vs
-  88 ms). `Frontier` was slowest everywhere (up to 22 s).
+- **Schedule** (by BGP size; no s-graph schedule is safe on every shape).
+  Up to three atoms: `Schedule::Levels` (every atom advances one FST level
+  at a time, synchronized on shared variable bits). From four: `Adaptive`.
+  Measured on small.nt with s-graph 4833f68 (ms; ✗ = over 100 s):
+
+  | shape | Levels | Adaptive | Nested |
+  |---|---|---|---|
+  | 2-atom star `?s a C ; label ?v` (Q9) | 16-20 | 800 | |
+  | `?a ?p ?b . ?b a ?c` (D5) | 200 | 6,000 | |
+  | 3-atom star | 456 | 1,368 | 1,394 |
+  | `?a link ?b . ?b a C ; label ?l` | 241 | 206 | 2,838 |
+  | `?a link ?b . ?b link ?c . ?c a C` | 9,552 | ✗ | 5,176 |
+  | 4-atom chain with ends | 14,000-23,000 | 665 | 3,952 |
+  | 4-atom star | ✗ | 4,992 | 5,013 |
+  | 5-atom chain with ends | ✗ | 5,720 | 5,660 |
+  | 10-atom chain | ✗ | 6,900 | 6,600 |
+
+  `Adaptive` gained connected candidate orders in 4833f68, but its order
+  still starts at the atom with the most constants and walks chains
+  backwards (object bound, subject free), which on an S/P/O FST scans the
+  predicate's subjects per lookup. Even the forward order costs 1.6-3.9 s
+  on these chains: each point lookup is ~2-3 µs.
 - A BGP over a merged default graph (`FROM` several graphs) → pattern-at-a-time
   joins over merged scans (most-bound first); merged scans skip triples an
   earlier graph produced (RDF merge = set).
@@ -267,8 +282,9 @@ per-row key allocation.
 - Decimals are `f64` (no arbitrary precision); MD5/SHA*, SPARQL Update,
   SERVICE, RDF/XML and JSON-LD are not implemented; DESCRIBE returns the
   resource's outgoing triples (no blank-node closure).
-- **s-graph, measured here**: the `Adaptive` schedule picks nested
-  traversal where `Levels` is 3-30× faster (see Schedule above); FST
+- **s-graph, measured here**: no schedule is safe on every BGP shape (see
+  Schedule above; `Levels` explodes from four atoms, `Adaptive` on some
+  3-atom chains and on stars); FST
   `count_matching` is 3-4× slower than the radix tree's (HashMap memo);
   `MutableFst` has no projection (`select`/`restricted_descent_visit`), so
   "distinct subjects of a predicate" is a scan; the FST build is

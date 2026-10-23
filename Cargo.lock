@@ -103,7 +103,7 @@ source = "git+https://github.com/hrssilva/s-dict?branch=master#2ee3be163bd359bdd
 [[package]]
 name = "s-graph"
 version = "0.1.0"
-source = "git+https://github.com/hrssilva/s-graph?branch=master#b1683f2eda7b16877807b3368241bf220bfa78bd"
+source = "git+https://github.com/hrssilva/s-graph?branch=master#4833f68f9cb0170aa8fb09c53a7f5a306f8e0303"
 dependencies = [
  "lz4_flex",
 ]

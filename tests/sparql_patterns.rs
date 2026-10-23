@@ -61,6 +61,26 @@ fn star_and_chain_joins() {
     );
 }
 
+/// BGPs of four or more atoms run under a different s-graph schedule than
+/// smaller ones; long stars and chains, with constants at either end,
+/// must give the same answers.
+#[test]
+fn long_stars_and_chains() {
+    let st = people();
+    assert_eq!(
+        select(&st, "SELECT ?x ?n ?a ?e WHERE { ?x ex:name ?n ; ex:age ?a ; ex:email ?e ; ex:knows ex:carol }"),
+        rows(&[&["<http://ex/bob>", "\"Bob\"", &int(25), "\"bob@ex\""]])
+    );
+    assert_eq!(
+        select(&st, "SELECT ?n WHERE { ?w ex:knows ?x . ?x ex:knows ?y . ?y ex:knows ?z . ?z ex:name ?n . ?w ex:knows ex:alice }"),
+        rows(&[&["\"Carol\""]])
+    );
+    assert_eq!(
+        select(&st, "SELECT ?w ?y WHERE { ?w ex:knows ?x . ?x ex:knows ?y . ?y ex:age 35 . ?x ex:age ?a . ?w ex:name ?n }"),
+        rows(&[&["<http://ex/alice>", "<http://ex/carol>"]])
+    );
+}
+
 #[test]
 fn variable_predicates_join_with_other_positions() {
     let st = store_with("ex:p ex:label \"P\" . ex:a ex:p ex:b . ex:a ex:label \"A\" .");
